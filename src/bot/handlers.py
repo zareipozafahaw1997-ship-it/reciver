@@ -99,7 +99,320 @@ class BotHandler:
             buttons=Button.inline("❌ لغو", b"cancel")
         )
     
-    def _select_accounts(self, count_input: str, all_accounts: list) -> list:
+    async def _ask_workers_count(self, event, user_id, total_accounts: int, next_step: str):
+        """
+        پرسیدن تعداد worker از کاربر
+        
+        Args:
+            event: رویداد تلگرام
+            user_id: آیدی کاربر
+            total_accounts: تعداد اکانت‌های انتخاب شده
+            next_step: مرحله بعدی
+        """
+        self.user_states[user_id]['step'] = next_step
+        
+        # محاسبه زمان تخمینی
+        avg_delay = Config.DELAY_BETWEEN_ACTIONS + (Config.DELAY_RANDOM_RANGE / 2)
+        estimated_minutes_1 = int((total_accounts * avg_delay) / 60)
+        estimated_minutes_3 = int((total_accounts * avg_delay) / 60 / 3)
+        
+        await event.respond(
+            f"⚡ **سرعت اجرا**\n\n"
+            f"📊 تعداد اکانت‌های انتخاب شده: {total_accounts}\n\n"
+            f"چند تا اکانت همزمان اجرا شوند؟\n\n"
+            f"💡 **توصیه:**\n"
+            f"• `1` - یکی یکی (~{estimated_minutes_1} دقیقه) ✅\n"
+            f"• `3` - 3 تا همزمان (~{estimated_minutes_3} دقیقه)\n"
+            f"• `5` - 5 تا همزمان (سریع‌تر)\n"
+            f"• `10` - 10 تا همزمان (خیلی سریع)\n\n"
+            f"⚠️ **نکته:** هرچه عدد بیشتر، سریع‌تر ولی فشار بیشتر",
+            buttons=Button.inline("❌ لغو", b"cancel")
+        )
+    
+    async def _ask_time_limit(self, event, user_id, total_accounts: int, workers: int, next_step: str):
+        """
+        پرسیدن بازه زمانی از کاربر
+        
+        Args:
+            event: رویداد تلگرام
+            user_id: آیدی کاربر
+            total_accounts: تعداد اکانت‌های انتخاب شده
+            workers: تعداد worker
+            next_step: مرحله بعدی
+        """
+        self.user_states[user_id]['step'] = next_step
+        
+        # محاسبه زمان تخمینی با تاخیر فعلی
+        avg_delay = Config.DELAY_BETWEEN_ACTIONS + (Config.DELAY_RANDOM_RANGE / 2)
+        estimated_minutes = int((total_accounts * avg_delay) / 60 / workers)
+        
+        await event.respond(
+            f"⏰ **بازه زمانی اجرا**\n\n"
+            f"📊 تعداد اکانت‌ها: {total_accounts}\n"
+            f"⚡ همزمان: {workers} اکانت\n"
+            f"⏱ زمان تخمینی با تاخیر فعلی: ~{estimated_minutes} دقیقه\n\n"
+            f"💡 **می‌خواهید عملیات در چه بازه زمانی تموم شود؟**\n\n"
+            f"**گزینه‌ها:**\n"
+            f"• `/skip` - بدون محدودیت زمانی (با تاخیر فعلی)\n"
+            f"• عدد دقیقه ارسال کنید (مثلاً `30` برای 30 دقیقه)\n"
+            f"• یا فرمت ساعت:دقیقه (مثلاً `1:30` برای 1 ساعت و 30 دقیقه)\n\n"
+            f"⚠️ **نکته:** سیستم خودکار تاخیر بین اکانت‌ها را محاسبه می‌کند",
+            buttons=[[
+                Button.inline("⏩ بدون محدودیت", b"skip_time_limit"),
+                Button.inline("❌ لغو", b"cancel")
+            ]]
+        )
+    
+    def _parse_time_limit(self, text: str, total_accounts: int, workers: int) -> tuple:
+        """
+        پارس کردن بازه زمانی و محاسبه تاخیر
+        
+        Args:
+            text: ورودی کاربر
+            total_accounts: تعداد اکانت‌ها
+            workers: تعداد worker
+            
+        Returns:
+            (custom_delay, time_limit_text) یا (None, "") اگر skip باشه
+            
+        Raises:
+            ValueError: اگر ورودی نامعتبر باشد
+        """
+        if text.lower() == '/skip':
+            return None, ""
+        
+        # پارس کردن ورودی
+        total_minutes = 0
+        
+        if ':' in text:
+            # فرمت ساعت:دقیقه
+            parts = text.split(':')
+            hours = int(parts[0])
+            minutes = int(parts[1]) if len(parts) > 1 else 0
+            total_minutes = (hours * 60) + minutes
+        else:
+            # فقط دقیقه
+            total_minutes = int(text)
+        
+        if total_minutes < 1:
+            raise ValueError("بازه زمانی باید حداقل 1 دقیقه باشد")
+        
+        # محاسبه تاخیر مورد نیاز
+        total_seconds = total_minutes * 60
+        calculated_delay = (total_seconds / total_accounts) * workers
+        
+        # حداقل 1 ثانیه
+        if calculated_delay < 1:
+            min_minutes = int((total_accounts / workers) / 60) + 1
+            raise ValueError(f"بازه زمانی خیلی کم است! حداقل {min_minutes} دقیقه نیاز است")
+        
+        custom_delay = int(calculated_delay)
+        
+        # نمایش زمان به فرمت خوانا
+        if total_minutes >= 60:
+            hours = total_minutes // 60
+            mins = total_minutes % 60
+            time_limit_text = f"⏰ بازه زمانی: {hours} ساعت و {mins} دقیقه\n"
+        else:
+            time_limit_text = f"⏰ بازه زمانی: {total_minutes} دقیقه\n"
+        
+        time_limit_text += f"⏱ تاخیر محاسبه شده: ~{custom_delay} ثانیه بین هر اکانت\n"
+        
+        return custom_delay, time_limit_text
+    
+    async def _execute_bulk_operation(self, event, user_id, state, operation_type: str, operation_func, **kwargs):
+        """
+        اجرای عملیات دسته‌جمعی با worker و time limit
+        
+        Args:
+            event: رویداد تلگرام
+            user_id: آیدی کاربر
+            state: وضعیت کاربر
+            operation_type: نوع عملیات (join, leave, referral, message, react, block, unblock)
+            operation_func: تابع اجرای عملیات
+            **kwargs: پارامترهای اضافی برای operation_func
+        """
+        selected_accounts = state['selected_accounts']
+        workers = state['workers']
+        custom_delay = state.get('custom_delay')
+        time_limit_text = state.get('time_limit_text', '')
+        
+        total = len(selected_accounts)
+        
+        # تعیین تاخیر نهایی
+        if custom_delay is not None:
+            delay_text = f"⏱ تاخیر: ~{custom_delay} ثانیه (محاسبه شده)\n"
+        else:
+            delay_text = f"⏱ تاخیر: {Config.DELAY_BETWEEN_ACTIONS}-{Config.DELAY_BETWEEN_ACTIONS + Config.DELAY_RANDOM_RANGE} ثانیه (پیش‌فرض)\n"
+        
+        # نام عملیات برای نمایش
+        operation_names = {
+            'join': 'جوین',
+            'leave': 'لفت',
+            'referral': 'استارت رفرال',
+            'message': 'ارسال پیام',
+            'react': 'ری‌اکشن',
+            'view': 'سین',
+            'block': 'بلاک',
+            'unblock': 'انبلاک'
+        }
+        operation_name = operation_names.get(operation_type, 'عملیات')
+        
+        # ارسال پیام شروع
+        worker_text = f"⚡ همزمان: {workers} اکانت\n" if workers > 1 else ""
+        progress_msg = await event.respond(
+            f"⏳ **شروع عملیات {operation_name}**\n\n"
+            f"📊 تعداد اکانت‌ها: {total}\n"
+            f"{worker_text}"
+            f"{time_limit_text}"
+            f"{delay_text}\n"
+            f"لطفاً صبر کنید..."
+        )
+        
+        # تابع callback برای بروزرسانی پیشرفت
+        async def update_progress(current, total, message):
+            try:
+                await progress_msg.edit(
+                    f"⏳ **در حال {operation_name}...**\n\n"
+                    f"📊 پیشرفت: {current}/{total}\n"
+                    f"💬 {message}"
+                )
+            except:
+                pass
+        
+        # اجرای عملیات
+        session_paths = [acc.session_path for acc in selected_accounts]
+        
+        # فراخوانی تابع عملیات با پارامترها
+        results = await operation_func(
+            session_paths,
+            progress_callback=update_progress,
+            **kwargs
+        )
+        
+        # نمایش نتایج
+        results_text = f"📊 **نتایج {operation_name}:**\n\n"
+        
+        for i, detail in enumerate(results['details'][:10], 1):  # نمایش 10 مورد اول
+            phone_short = selected_accounts[i-1].phone[-4:] if selected_accounts[i-1].phone else "****"
+            result = detail['result']
+            
+            if result['success']:
+                results_text += f"✅ {phone_short}: موفق\n"
+            else:
+                error_msg = result.get('message', 'خطا')[:30]
+                results_text += f"❌ {phone_short}: {error_msg}\n"
+        
+        if len(results['details']) > 10:
+            results_text += f"\n... و {len(results['details']) - 10} مورد دیگر\n"
+        
+        results_text += f"\n✅ موفق: {results['success']}\n"
+        results_text += f"❌ ناموفق: {results['failed']}"
+        
+        return results_text, progress_msg, results
+    
+    async def _handle_operation_flow(self, event, user_id, step: str, operation_type: str):
+        """
+        مدیریت جریان کامل یک عملیات (count -> workers -> time_limit -> execute)
+        
+        Args:
+            event: رویداد تلگرام
+            user_id: آیدی کاربر
+            step: مرحله فعلی
+            operation_type: نوع عملیات
+            
+        Returns:
+            True اگر عملیات تکمیل شد، False اگر باید ادامه یابد
+        """
+        state = self.user_states.get(user_id, {})
+        
+        # مرحله 1: دریافت تعداد اکانت
+        if step.endswith('_count'):
+            count_input = event.message.text.strip()
+            active_accounts = state['active_accounts']
+            
+            # تعیین تعداد اکانت
+            if count_input.lower() == '/all':
+                selected_accounts = active_accounts
+            else:
+                try:
+                    count = int(count_input)
+                    if count <= 0:
+                        await event.respond(
+                            "❌ تعداد باید بیشتر از صفر باشد!",
+                            buttons=Button.inline("❌ لغو", b"cancel")
+                        )
+                        return False
+                    selected_accounts = active_accounts[:min(count, len(active_accounts))]
+                except ValueError:
+                    await event.respond(
+                        "❌ لطفاً یک عدد معتبر یا /all ارسال کنید.",
+                        buttons=Button.inline("❌ لغو", b"cancel")
+                    )
+                    return False
+            
+            # ذخیره اکانت‌های انتخاب شده
+            state['selected_accounts'] = selected_accounts
+            
+            # پرسیدن تعداد worker
+            await self._ask_workers_count(event, user_id, len(selected_accounts), f'{operation_type}_workers')
+            return False
+        
+        # مرحله 2: دریافت تعداد worker
+        elif step.endswith('_workers'):
+            try:
+                workers = int(event.message.text.strip())
+                if workers < 1:
+                    await event.respond(
+                        "❌ تعداد باید حداقل 1 باشد!",
+                        buttons=Button.inline("❌ لغو", b"cancel")
+                    )
+                    return False
+                if workers > 20:
+                    await event.respond(
+                        "❌ حداکثر 20 worker مجاز است!",
+                        buttons=Button.inline("❌ لغو", b"cancel")
+                    )
+                    return False
+            except ValueError:
+                await event.respond(
+                    "❌ لطفاً یک عدد معتبر ارسال کنید (مثلاً 3)",
+                    buttons=Button.inline("❌ لغو", b"cancel")
+                )
+                return False
+            
+            # ذخیره تعداد worker
+            state['workers'] = workers
+            selected_accounts = state['selected_accounts']
+            
+            # پرسیدن بازه زمانی
+            await self._ask_time_limit(event, user_id, len(selected_accounts), workers, f'{operation_type}_time_limit')
+            return False
+        
+        # مرحله 3: دریافت بازه زمانی
+        elif step.endswith('_time_limit'):
+            text = event.message.text.strip()
+            selected_accounts = state['selected_accounts']
+            workers = state['workers']
+            
+            # پارس کردن بازه زمانی
+            try:
+                custom_delay, time_limit_text = self._parse_time_limit(text, len(selected_accounts), workers)
+            except ValueError as e:
+                await event.respond(
+                    f"❌ {str(e)}",
+                    buttons=Button.inline("❌ لغو", b"cancel")
+                )
+                return False
+            
+            # ذخیره تاخیر سفارشی
+            state['custom_delay'] = custom_delay
+            state['time_limit_text'] = time_limit_text
+            
+            # حالا آماده اجرا هستیم
+            return True
+        
+        return False
         """
         انتخاب تعداد مشخصی از اکانت‌ها
         
@@ -1597,90 +1910,30 @@ class BotHandler:
                     buttons=Button.inline("❌ لغو", b"cancel")
                 )
             
-            elif step == 'join_count':
-                # دریافت تعداد اکانت
-                count_input = event.message.text.strip()
+            elif step in ['join_count', 'join_workers', 'join_time_limit']:
+                # مدیریت جریان عملیات جوین
+                is_ready = await self._handle_operation_flow(event, user_id, step, 'join')
                 
-                active_accounts = state['active_accounts']
-                channel_link = state['channel_link']
-                
-                # تعیین تعداد اکانت
-                if count_input.lower() == '/all':
-                    selected_accounts = active_accounts
-                else:
-                    try:
-                        count = int(count_input)
-                        if count <= 0:
-                            await event.respond(
-                                "❌ تعداد باید بیشتر از صفر باشد!",
-                                buttons=Button.inline("❌ لغو", b"cancel")
-                            )
-                            return
-                        selected_accounts = active_accounts[:min(count, len(active_accounts))]
-                    except ValueError:
-                        await event.respond(
-                            "❌ لطفاً یک عدد معتبر یا /all ارسال کنید.",
-                            buttons=Button.inline("❌ لغو", b"cancel")
-                        )
-                        return
-                
-                total = len(selected_accounts)
-                
-                # ارسال پیام شروع
-                progress_msg = await event.respond(
-                    f"⏳ **شروع عملیات جوین**\n\n"
-                    f"📊 تعداد اکانت‌ها: {total}\n"
-                    f"⏱ تاخیر بین هر عملیات: {Config.DELAY_BETWEEN_ACTIONS}-{Config.DELAY_BETWEEN_ACTIONS + Config.DELAY_RANDOM_RANGE} ثانیه\n\n"
-                    f"لطفاً صبر کنید..."
-                )
-                
-                # تابع callback برای بروزرسانی پیشرفت
-                async def update_progress(current, total, message):
-                    try:
-                        await progress_msg.edit(
-                            f"⏳ **در حال جوین...**\n\n"
-                            f"📊 پیشرفت: {current}/{total}\n"
-                            f"💬 {message}"
-                        )
-                    except:
-                        pass
-                
-                # جوین دسته‌جمعی با تایمر
-                session_paths = [acc.session_path for acc in selected_accounts]
-                results = await self.channel_manager.bulk_join(
-                    session_paths,
-                    channel_link,
-                    progress_callback=update_progress
-                )
-                
-                # نمایش نتایج
-                results_text = "📊 **نتایج جوین:**\n\n"
-                
-                for i, detail in enumerate(results['details'][:10], 1):  # نمایش 10 مورد اول
-                    phone_short = selected_accounts[i-1].phone[-4:] if selected_accounts[i-1].phone else "****"
-                    result = detail['result']
+                if is_ready:
+                    # اجرای عملیات جوین
+                    channel_link = state['channel_link']
                     
-                    if result['success']:
-                        results_text += f"✅ {phone_short}: موفق\n"
-                    else:
-                        results_text += f"❌ {phone_short}: {result['message'][:30]}\n"
-                
-                if len(results['details']) > 10:
-                    results_text += f"\n... و {len(results['details']) - 10} مورد دیگر\n"
-                
-                results_text += f"\n✅ موفق: {results['success']}\n"
-                results_text += f"❌ ناموفق: {results['failed']}"
-                
-                await progress_msg.edit(
-                    results_text,
-                    buttons=[
-                        [Button.inline("🔗 جوین مجدد", b"join_channel")],
-                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
-                    ]
-                )
-                
-                await self.db.log_action('bulk_join', user_id, f"{channel_link} - {results['success']}/{total}")
-                del self.user_states[user_id]
+                    results_text, progress_msg, results = await self._execute_bulk_operation(
+                        event, user_id, state, 'join',
+                        self.channel_manager.bulk_join,
+                        channel_link=channel_link
+                    )
+                    
+                    await progress_msg.edit(
+                        results_text,
+                        buttons=[
+                            [Button.inline("🔗 جوین مجدد", b"join_channel")],
+                            [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
+                        ]
+                    )
+                    
+                    await self.db.log_action('bulk_join', user_id, f"{channel_link} - {results['success']}/{len(state['selected_accounts'])}")
+                    del self.user_states[user_id]
             
             elif step == 'leave_link':
                 # دریافت لینک برای لفت
@@ -1712,90 +1965,30 @@ class BotHandler:
                     buttons=Button.inline("❌ لغو", b"cancel")
                 )
             
-            elif step == 'leave_count':
-                # دریافت تعداد اکانت
-                count_input = event.message.text.strip()
+            elif step in ['leave_count', 'leave_workers', 'leave_time_limit']:
+                # مدیریت جریان عملیات لفت
+                is_ready = await self._handle_operation_flow(event, user_id, step, 'leave')
                 
-                active_accounts = state['active_accounts']
-                channel_link = state['channel_link']
-                
-                # تعیین تعداد اکانت
-                if count_input.lower() == '/all':
-                    selected_accounts = active_accounts
-                else:
-                    try:
-                        count = int(count_input)
-                        if count <= 0:
-                            await event.respond(
-                                "❌ تعداد باید بیشتر از صفر باشد!",
-                                buttons=Button.inline("❌ لغو", b"cancel")
-                            )
-                            return
-                        selected_accounts = active_accounts[:min(count, len(active_accounts))]
-                    except ValueError:
-                        await event.respond(
-                            "❌ لطفاً یک عدد معتبر یا /all ارسال کنید.",
-                            buttons=Button.inline("❌ لغو", b"cancel")
-                        )
-                        return
-                
-                total = len(selected_accounts)
-                
-                # ارسال پیام شروع
-                progress_msg = await event.respond(
-                    f"⏳ **شروع عملیات لفت**\n\n"
-                    f"📊 تعداد اکانت‌ها: {total}\n"
-                    f"⏱ تاخیر بین هر عملیات: {Config.DELAY_BETWEEN_ACTIONS}-{Config.DELAY_BETWEEN_ACTIONS + Config.DELAY_RANDOM_RANGE} ثانیه\n\n"
-                    f"لطفاً صبر کنید..."
-                )
-                
-                # تابع callback برای بروزرسانی پیشرفت
-                async def update_progress(current, total, message):
-                    try:
-                        await progress_msg.edit(
-                            f"⏳ **در حال لفت...**\n\n"
-                            f"📊 پیشرفت: {current}/{total}\n"
-                            f"💬 {message}"
-                        )
-                    except:
-                        pass
-                
-                # لفت دسته‌جمعی با تایمر
-                session_paths = [acc.session_path for acc in selected_accounts]
-                results = await self.channel_manager.bulk_leave(
-                    session_paths,
-                    channel_link,
-                    progress_callback=update_progress
-                )
-                
-                # نمایش نتایج
-                results_text = "📊 **نتایج لفت:**\n\n"
-                
-                for i, detail in enumerate(results['details'][:10], 1):  # نمایش 10 مورد اول
-                    phone_short = selected_accounts[i-1].phone[-4:] if selected_accounts[i-1].phone else "****"
-                    result = detail['result']
+                if is_ready:
+                    # اجرای عملیات لفت
+                    channel_link = state['channel_link']
                     
-                    if result['success']:
-                        results_text += f"✅ {phone_short}: موفق\n"
-                    else:
-                        results_text += f"❌ {phone_short}: {result['message'][:30]}\n"
-                
-                if len(results['details']) > 10:
-                    results_text += f"\n... و {len(results['details']) - 10} مورد دیگر\n"
-                
-                results_text += f"\n✅ موفق: {results['success']}\n"
-                results_text += f"❌ ناموفق: {results['failed']}"
-                
-                await progress_msg.edit(
-                    results_text,
-                    buttons=[
-                        [Button.inline("🚪 لفت مجدد", b"leave_channel")],
-                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
-                    ]
-                )
-                
-                await self.db.log_action('bulk_leave', user_id, f"{channel_link} - {results['success']}/{total}")
-                del self.user_states[user_id]
+                    results_text, progress_msg, results = await self._execute_bulk_operation(
+                        event, user_id, state, 'leave',
+                        self.channel_manager.bulk_leave,
+                        channel_link=channel_link
+                    )
+                    
+                    await progress_msg.edit(
+                        results_text,
+                        buttons=[
+                            [Button.inline("🚪 لفت مجدد", b"leave_channel")],
+                            [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
+                        ]
+                    )
+                    
+                    await self.db.log_action('bulk_leave', user_id, f"{channel_link} - {results['success']}/{len(state['selected_accounts'])}")
+                    del self.user_states[user_id]
 
             elif step == 'referral_link':
                 # دریافت لینک رفرال
