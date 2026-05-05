@@ -3008,8 +3008,112 @@ class BotHandler:
                     )
                     return
                 
+                # ذخیره تعداد worker
+                state['workers'] = workers
+                state['step'] = 'scenario_time_limit'
+                
+                # پرسیدن بازه زمانی
+                selected_accounts = state['selected_accounts']
+                total_accounts = len(selected_accounts)
+                
+                # محاسبه زمان تخمینی با تاخیر فعلی
+                avg_delay = Config.DELAY_BETWEEN_ACTIONS + (Config.DELAY_RANDOM_RANGE / 2)
+                estimated_minutes = int((total_accounts * avg_delay) / 60 / workers)
+                
+                await event.respond(
+                    f"⏰ **بازه زمانی اجرا**\n\n"
+                    f"📊 تعداد اکانت‌ها: {total_accounts}\n"
+                    f"⚡ همزمان: {workers} اکانت\n"
+                    f"⏱ زمان تخمینی با تاخیر فعلی: ~{estimated_minutes} دقیقه\n\n"
+                    f"💡 **می‌خواهید سناریو در چه بازه زمانی تموم شود؟**\n\n"
+                    f"**گزینه‌ها:**\n"
+                    f"• `/skip` - بدون محدودیت زمانی (با تاخیر فعلی)\n"
+                    f"• عدد دقیقه ارسال کنید (مثلاً `30` برای 30 دقیقه)\n"
+                    f"• یا فرمت ساعت:دقیقه (مثلاً `1:30` برای 1 ساعت و 30 دقیقه)\n\n"
+                    f"⚠️ **نکته:** سیستم خودکار تاخیر بین اکانت‌ها را محاسبه می‌کند",
+                    buttons=[[
+                        Button.inline("⏩ بدون محدودیت", b"skip_time_limit"),
+                        Button.inline("❌ لغو", b"cancel")
+                    ]]
+                )
+            
+            elif step == 'scenario_time_limit':
+                # دریافت بازه زمانی
+                text = event.message.text.strip()
+                
+                custom_delay = None  # تاخیر سفارشی (None = استفاده از تاخیر پیش‌فرض)
+                time_limit_text = ""
+                
+                if text.lower() != '/skip':
+                    try:
+                        # پارس کردن ورودی
+                        total_minutes = 0
+                        
+                        if ':' in text:
+                            # فرمت ساعت:دقیقه
+                            parts = text.split(':')
+                            hours = int(parts[0])
+                            minutes = int(parts[1]) if len(parts) > 1 else 0
+                            total_minutes = (hours * 60) + minutes
+                        else:
+                            # فقط دقیقه
+                            total_minutes = int(text)
+                        
+                        if total_minutes < 1:
+                            await event.respond(
+                                "❌ بازه زمانی باید حداقل 1 دقیقه باشد!",
+                                buttons=Button.inline("❌ لغو", b"cancel")
+                            )
+                            return
+                        
+                        # محاسبه تاخیر مورد نیاز
+                        selected_accounts = state['selected_accounts']
+                        workers = state['workers']
+                        total_accounts = len(selected_accounts)
+                        
+                        # زمان کل به ثانیه
+                        total_seconds = total_minutes * 60
+                        
+                        # محاسبه تاخیر بین هر اکانت
+                        # فرمول: (زمان کل / تعداد اکانت) * تعداد worker
+                        calculated_delay = (total_seconds / total_accounts) * workers
+                        
+                        # حداقل 1 ثانیه
+                        if calculated_delay < 1:
+                            await event.respond(
+                                f"❌ بازه زمانی خیلی کمه!\n\n"
+                                f"برای {total_accounts} اکانت با {workers} worker همزمان،\n"
+                                f"حداقل {int((total_accounts / workers) / 60) + 1} دقیقه نیاز است.",
+                                buttons=Button.inline("❌ لغو", b"cancel")
+                            )
+                            return
+                        
+                        custom_delay = int(calculated_delay)
+                        
+                        # نمایش زمان به فرمت خوانا
+                        if total_minutes >= 60:
+                            hours = total_minutes // 60
+                            mins = total_minutes % 60
+                            time_limit_text = f"⏰ بازه زمانی: {hours} ساعت و {mins} دقیقه\n"
+                        else:
+                            time_limit_text = f"⏰ بازه زمانی: {total_minutes} دقیقه\n"
+                        
+                        time_limit_text += f"⏱ تاخیر محاسبه شده: ~{custom_delay} ثانیه بین هر اکانت\n"
+                        
+                    except ValueError:
+                        await event.respond(
+                            "❌ فرمت نامعتبر!\n\n"
+                            "لطفاً یکی از فرمت‌های زیر را استفاده کنید:\n"
+                            "• `30` (30 دقیقه)\n"
+                            "• `1:30` (1 ساعت و 30 دقیقه)\n"
+                            "• `/skip` (بدون محدودیت)",
+                            buttons=Button.inline("❌ لغو", b"cancel")
+                        )
+                        return
+                
                 # دریافت اطلاعات از state
                 selected_accounts = state['selected_accounts']
+                workers = state['workers']
                 scenario_summary = state['scenario_summary']
                 is_multi_bot = state.get('multi_bot', False)
                 start_index = state.get('start_index', 0)
@@ -3028,13 +3132,21 @@ class BotHandler:
                 # ارسال پیام شروع با دکمه‌های کنترل
                 resume_text = f"▶️ ادامه از اکانت {start_index + 1}\n" if resume_mode else ""
                 worker_text = f"⚡ همزمان: {workers} اکانت\n" if workers > 1 else ""
+                
+                # تعیین تاخیر نهایی
+                if custom_delay is not None:
+                    delay_text = f"⏱ تاخیر: ~{custom_delay} ثانیه (محاسبه شده برای بازه زمانی)\n"
+                else:
+                    delay_text = f"⏱ تاخیر: {Config.DELAY_BETWEEN_ACTIONS}-{Config.DELAY_BETWEEN_ACTIONS + Config.DELAY_RANDOM_RANGE} ثانیه (پیش‌فرض)\n"
+                
                 progress_msg = await event.respond(
                     f"⏳ **شروع اجرای سناریو**\n\n"
                     f"{scenario_summary}\n"
                     f"{resume_text}"
                     f"📊 تعداد اکانت‌ها: {total}\n"
                     f"{worker_text}"
-                    f"⏱ تاخیر بین هر اکانت: {Config.DELAY_BETWEEN_ACTIONS}-{Config.DELAY_BETWEEN_ACTIONS + Config.DELAY_RANDOM_RANGE} ثانیه\n\n"
+                    f"{time_limit_text}"
+                    f"{delay_text}\n"
                     f"✅ **عملیات در پس‌زمینه شروع شد!**\n"
                     f"💡 می‌توانید کارهای دیگر انجام دهید.",
                     buttons=[
@@ -3200,7 +3312,12 @@ class BotHandler:
                                 await process_account(account, index)
                                 # تاخیر بین اکانت‌ها
                                 if index < total and not cancel_flag.get('cancelled'):
-                                    delay = Config.DELAY_BETWEEN_ACTIONS + random.randint(0, Config.DELAY_RANDOM_RANGE)
+                                    if custom_delay is not None:
+                                        # استفاده از تاخیر محاسبه شده
+                                        delay = custom_delay
+                                    else:
+                                        # استفاده از تاخیر پیش‌فرض
+                                        delay = Config.DELAY_BETWEEN_ACTIONS + random.randint(0, Config.DELAY_RANDOM_RANGE)
                                     await asyncio.sleep(delay)
                         else:
                             # حالت چند worker (همزمان)
@@ -3527,6 +3644,44 @@ class BotHandler:
                 
                 # پاک کردن state کاربر تا بتونه کار دیگه شروع کنه
                 del self.user_states[user_id]
+        
+        @self.bot.on(events.CallbackQuery(pattern=b"skip_time_limit"))
+        async def skip_time_limit_callback(event):
+            """رد کردن محدودیت زمانی"""
+            user_id = event.sender_id
+            
+            if user_id not in self.user_states:
+                await event.answer("⚠️ لطفاً دوباره سناریو را ارسال کنید", alert=True)
+                return
+            
+            state = self.user_states[user_id]
+            
+            # شبیه‌سازی ارسال /skip
+            state['step'] = 'scenario_time_limit'
+            
+            # ایجاد یک event ساختگی با متن /skip
+            class FakeMessage:
+                def __init__(self):
+                    self.text = "/skip"
+            
+            class FakeEvent:
+                def __init__(self, sender_id, message):
+                    self.sender_id = sender_id
+                    self.message = message
+                    self._respond = event.respond
+                    self._edit = event.edit
+                
+                async def respond(self, *args, **kwargs):
+                    return await self._respond(*args, **kwargs)
+                
+                async def edit(self, *args, **kwargs):
+                    return await self._edit(*args, **kwargs)
+            
+            fake_event = FakeEvent(user_id, FakeMessage())
+            
+            # فراخوانی handler اصلی
+            await handle_text_message(fake_event)
+            await event.answer("✅ بدون محدودیت زمانی")
         
         @self.bot.on(events.CallbackQuery(pattern=b"cancel_scenario"))
         async def cancel_scenario_callback(event):
