@@ -185,7 +185,7 @@ class ReferralManager:
     
     async def bulk_start_bot(self, session_paths: List[str], bot_username: str,
                             start_param: str, click_button: Optional[str] = None,
-                            progress_callback=None) -> Dict[str, any]:
+                            progress_callback=None, workers: int = 1, custom_delay: int = None) -> Dict[str, any]:
         """
         استارت دسته‌جمعی ربات با چند اکانت
         
@@ -195,6 +195,8 @@ class ReferralManager:
             start_param: پارامتر استارت (رفرال)
             click_button: متن دکمه برای کلیک (اختیاری)
             progress_callback: تابع callback برای نمایش پیشرفت
+            workers: تعداد اکانت‌های همزمان
+            custom_delay: تاخیر سفارشی (None = استفاده از تاخیر پیش‌فرض)
             
         Returns:
             دیکشنری حاوی نتایج
@@ -208,38 +210,53 @@ class ReferralManager:
         
         total = len(session_paths)
         
-        for index, session_path in enumerate(session_paths, 1):
-            # محاسبه تاخیر تصادفی
-            delay = Config.DELAY_BETWEEN_ACTIONS + random.randint(0, Config.DELAY_RANDOM_RANGE)
+        # اجرای همزمان با worker
+        for i in range(0, total, workers):
+            batch = session_paths[i:i + workers]
+            tasks = []
             
-            # اگر callback داریم، پیشرفت رو نمایش بدیم
-            if progress_callback:
-                await progress_callback(index, total, f"در حال استارت اکانت {index}/{total}...")
+            for session_path in batch:
+                tasks.append(self.start_bot_with_referral(
+                    session_path, 
+                    bot_username, 
+                    start_param,
+                    click_button
+                ))
             
-            logger.info(f"استارت اکانت {index}/{total} - تاخیر: {delay}s")
+            # اجرای همزمان batch
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            result = await self.start_bot_with_referral(
-                session_path, 
-                bot_username, 
-                start_param,
-                click_button
-            )
+            # پردازش نتایج
+            for j, result in enumerate(batch_results):
+                index = i + j + 1
+                
+                if isinstance(result, Exception):
+                    result = {'success': False, 'message': str(result)}
+                
+                if result['success']:
+                    results['success'] += 1
+                    if result.get('button_clicked'):
+                        results['button_clicked'] += 1
+                else:
+                    results['failed'] += 1
+                
+                results['details'].append({
+                    'session': Path(batch[j]).name,
+                    'result': result
+                })
+                
+                # بروزرسانی پیشرفت
+                if progress_callback:
+                    await progress_callback(index, total, f"در حال استارت اکانت {index}/{total}...")
             
-            if result['success']:
-                results['success'] += 1
-                if result.get('button_clicked'):
-                    results['button_clicked'] += 1
-            else:
-                results['failed'] += 1
-            
-            results['details'].append({
-                'session': Path(session_path).name,
-                'result': result
-            })
-            
-            # تاخیر بین عملیات‌ها (به جز آخرین مورد)
-            if index < total:
-                logger.info(f"صبر {delay} ثانیه قبل از عملیات بعدی...")
+            # تاخیر بین batch‌ها (به جز آخرین batch)
+            if i + workers < total:
+                if custom_delay is not None:
+                    delay = custom_delay
+                else:
+                    delay = Config.DELAY_BETWEEN_ACTIONS + random.randint(0, Config.DELAY_RANDOM_RANGE)
+                
+                logger.info(f"صبر {delay} ثانیه قبل از batch بعدی...")
                 await asyncio.sleep(delay)
         
         return results

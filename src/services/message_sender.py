@@ -127,7 +127,7 @@ class MessageSender:
                 await client.disconnect()
     
     async def bulk_send_message(self, session_paths: List[str], target: str,
-                               message: str, progress_callback=None) -> Dict[str, any]:
+                               message: str, progress_callback=None, workers: int = 1, custom_delay: int = None) -> Dict[str, any]:
         """
         ارسال دسته‌جمعی پیام با چند اکانت
         
@@ -136,6 +136,8 @@ class MessageSender:
             target: یوزرنیم یا آیدی کاربر مقصد
             message: متن پیام
             progress_callback: تابع callback برای نمایش پیشرفت
+            workers: تعداد اکانت‌های همزمان
+            custom_delay: تاخیر سفارشی (None = استفاده از تاخیر پیش‌فرض)
             
         Returns:
             دیکشنری حاوی نتایج
@@ -148,31 +150,46 @@ class MessageSender:
         
         total = len(session_paths)
         
-        for index, session_path in enumerate(session_paths, 1):
-            # محاسبه تاخیر تصادفی
-            delay = Config.DELAY_BETWEEN_ACTIONS + random.randint(0, Config.DELAY_RANDOM_RANGE)
+        # اجرای همزمان با worker
+        for i in range(0, total, workers):
+            batch = session_paths[i:i + workers]
+            tasks = []
             
-            # اگر callback داریم، پیشرفت رو نمایش بدیم
-            if progress_callback:
-                await progress_callback(index, total, f"در حال ارسال از اکانت {index}/{total}...")
+            for session_path in batch:
+                tasks.append(self.send_message(session_path, target, message))
             
-            logger.info(f"ارسال پیام از اکانت {index}/{total} - تاخیر: {delay}s")
+            # اجرای همزمان batch
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            result = await self.send_message(session_path, target, message)
+            # پردازش نتایج
+            for j, result in enumerate(batch_results):
+                index = i + j + 1
+                
+                if isinstance(result, Exception):
+                    result = {'success': False, 'message': str(result)}
+                
+                if result['success']:
+                    results['success'] += 1
+                else:
+                    results['failed'] += 1
+                
+                results['details'].append({
+                    'session': Path(batch[j]).name,
+                    'result': result
+                })
+                
+                # بروزرسانی پیشرفت
+                if progress_callback:
+                    await progress_callback(index, total, f"در حال ارسال از اکانت {index}/{total}...")
             
-            if result['success']:
-                results['success'] += 1
-            else:
-                results['failed'] += 1
-            
-            results['details'].append({
-                'session': Path(session_path).name,
-                'result': result
-            })
-            
-            # تاخیر بین عملیات‌ها (به جز آخرین مورد)
-            if index < total:
-                logger.info(f"صبر {delay} ثانیه قبل از عملیات بعدی...")
+            # تاخیر بین batch‌ها (به جز آخرین batch)
+            if i + workers < total:
+                if custom_delay is not None:
+                    delay = custom_delay
+                else:
+                    delay = Config.DELAY_BETWEEN_ACTIONS + random.randint(0, Config.DELAY_RANDOM_RANGE)
+                
+                logger.info(f"صبر {delay} ثانیه قبل از batch بعدی...")
                 await asyncio.sleep(delay)
         
         return results
