@@ -3856,12 +3856,22 @@ class BotHandler:
             state = self.user_states[user_id]
             current_step = state.get('step', '')
             
+            # چک کردن اینکه آیا اطلاعات لازم موجود است
+            if 'selected_accounts' not in state or 'workers' not in state:
+                await event.answer("❌ خطا: اطلاعات ناقص است. لطفاً دوباره شروع کنید", alert=True)
+                del self.user_states[user_id]
+                return
+            
             # ذخیره تاخیر سفارشی به عنوان None (بدون محدودیت)
             state['custom_delay'] = None
             state['time_limit_text'] = ''
             
             # تشخیص نوع عملیات و اجرا
             if 'join' in current_step:
+                if 'channel_link' not in state:
+                    await event.answer("❌ خطا: لینک کانال موجود نیست", alert=True)
+                    return
+                    
                 channel_link = state['channel_link']
                 results_text, progress_msg, results = await self._execute_bulk_operation(
                     event, user_id, state, 'join',
@@ -3879,6 +3889,10 @@ class BotHandler:
                 del self.user_states[user_id]
                 
             elif 'leave' in current_step:
+                if 'channel_link' not in state:
+                    await event.answer("❌ خطا: لینک کانال موجود نیست", alert=True)
+                    return
+                    
                 channel_link = state['channel_link']
                 results_text, progress_msg, results = await self._execute_bulk_operation(
                     event, user_id, state, 'leave',
@@ -3896,9 +3910,13 @@ class BotHandler:
                 del self.user_states[user_id]
                 
             elif 'referral' in current_step:
-                bot_username = state['bot_username']
-                start_param = state['start_param']
+                bot_username = state.get('bot_username')
+                start_param = state.get('start_param')
                 click_button = state.get('click_button')
+                
+                if not bot_username or not start_param:
+                    await event.answer("❌ خطا: اطلاعات رفرال موجود نیست", alert=True)
+                    return
                 
                 results_text, progress_msg, results = await self._execute_bulk_operation(
                     event, user_id, state, 'referral',
@@ -3923,8 +3941,12 @@ class BotHandler:
                 del self.user_states[user_id]
                 
             elif 'message' in current_step:
-                target = state['target']
-                message = state['message']
+                target = state.get('target')
+                message = state.get('message')
+                
+                if not target or not message:
+                    await event.answer("❌ خطا: اطلاعات پیام موجود نیست", alert=True)
+                    return
                 
                 results_text, progress_msg, results = await self._execute_bulk_operation(
                     event, user_id, state, 'message',
@@ -3943,9 +3965,13 @@ class BotHandler:
                 del self.user_states[user_id]
                 
             elif 'react' in current_step:
-                channel_link = state['channel_link']
-                message_id = state['message_id']
+                channel_link = state.get('channel_link')
+                message_id = state.get('message_id')
                 reaction_count = state.get('reaction_count', 5)
+                
+                if not channel_link or not message_id:
+                    await event.answer("❌ خطا: اطلاعات ری‌اکشن موجود نیست", alert=True)
+                    return
                 
                 results_text, progress_msg, results = await self._execute_bulk_operation(
                     event, user_id, state, 'react',
@@ -3965,7 +3991,11 @@ class BotHandler:
                 del self.user_states[user_id]
                 
             elif 'block' in current_step:
-                target = state['target']
+                target = state.get('target')
+                
+                if not target:
+                    await event.answer("❌ خطا: اطلاعات بلاک موجود نیست", alert=True)
+                    return
                 
                 results_text, progress_msg, results = await self._execute_bulk_operation(
                     event, user_id, state, 'block',
@@ -3983,7 +4013,11 @@ class BotHandler:
                 del self.user_states[user_id]
                 
             elif 'unblock' in current_step:
-                target = state['target']
+                target = state.get('target')
+                
+                if not target:
+                    await event.answer("❌ خطا: اطلاعات انبلاک موجود نیست", alert=True)
+                    return
                 
                 results_text, progress_msg, results = await self._execute_bulk_operation(
                     event, user_id, state, 'unblock',
