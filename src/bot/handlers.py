@@ -3844,13 +3844,40 @@ class BotHandler:
             user_id = event.sender_id
             
             if user_id not in self.user_states:
-                await event.answer("⚠️ لطفاً دوباره سناریو را ارسال کنید", alert=True)
+                await event.answer("⚠️ لطفاً دوباره عملیات را شروع کنید", alert=True)
                 return
             
             state = self.user_states[user_id]
+            current_step = state.get('step', '')
             
-            # شبیه‌سازی ارسال /skip
-            state['step'] = 'scenario_time_limit'
+            # تشخیص نوع عملیات از step
+            if 'scenario' in current_step:
+                # برای سناریو
+                state['step'] = 'scenario_time_limit'
+            elif 'join' in current_step:
+                # برای جوین
+                state['step'] = 'join_time_limit'
+            elif 'leave' in current_step:
+                # برای لفت
+                state['step'] = 'leave_time_limit'
+            elif 'referral' in current_step:
+                # برای رفرال
+                state['step'] = 'referral_time_limit'
+            elif 'message' in current_step:
+                # برای پیام
+                state['step'] = 'message_time_limit'
+            elif 'react' in current_step:
+                # برای ری‌اکشن
+                state['step'] = 'react_time_limit'
+            elif 'view' in current_step:
+                # برای سین
+                state['step'] = 'view_time_limit'
+            elif 'block' in current_step:
+                # برای بلاک
+                state['step'] = 'block_time_limit'
+            elif 'unblock' in current_step:
+                # برای انبلاک
+                state['step'] = 'unblock_time_limit'
             
             # ایجاد یک event ساختگی با متن /skip
             class FakeMessage:
@@ -3858,19 +3885,23 @@ class BotHandler:
                     self.text = "/skip"
             
             class FakeEvent:
-                def __init__(self, sender_id, message):
+                def __init__(self, sender_id, message, original_event):
                     self.sender_id = sender_id
                     self.message = message
-                    self._respond = event.respond
-                    self._edit = event.edit
+                    self._respond = original_event.respond
+                    self._edit = original_event.edit
+                    self._answer = original_event.answer
                 
                 async def respond(self, *args, **kwargs):
                     return await self._respond(*args, **kwargs)
                 
                 async def edit(self, *args, **kwargs):
                     return await self._edit(*args, **kwargs)
+                
+                async def answer(self, *args, **kwargs):
+                    return await self._answer(*args, **kwargs)
             
-            fake_event = FakeEvent(user_id, FakeMessage())
+            fake_event = FakeEvent(user_id, FakeMessage(), event)
             
             # فراخوانی handler اصلی
             await handle_text_message(fake_event)
