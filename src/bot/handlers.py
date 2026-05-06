@@ -283,10 +283,12 @@ class BotHandler:
         # اجرای عملیات
         session_paths = [acc.session_path for acc in selected_accounts]
         
-        # فراخوانی تابع عملیات با پارامترها
+        # فراخوانی تابع عملیات با پارامترها (اضافه کردن workers و custom_delay)
         results = await operation_func(
             session_paths,
             progress_callback=update_progress,
+            workers=workers,
+            custom_delay=custom_delay,
             **kwargs
         )
         
@@ -308,6 +310,8 @@ class BotHandler:
         
         results_text += f"\n✅ موفق: {results['success']}\n"
         results_text += f"❌ ناموفق: {results['failed']}"
+        
+        return results_text, progress_msg, results
         
         return results_text, progress_msg, results
     
@@ -3850,61 +3854,80 @@ class BotHandler:
             state = self.user_states[user_id]
             current_step = state.get('step', '')
             
-            # تشخیص نوع عملیات از step
-            if 'scenario' in current_step:
-                # برای سناریو
-                state['step'] = 'scenario_time_limit'
-            elif 'join' in current_step:
-                # برای جوین
-                state['step'] = 'join_time_limit'
+            # مستقیم پردازش می‌کنیم بدون fake event
+            # تشخیص نوع عملیات
+            operation_type = None
+            if 'join' in current_step:
+                operation_type = 'join'
             elif 'leave' in current_step:
-                # برای لفت
-                state['step'] = 'leave_time_limit'
+                operation_type = 'leave'
             elif 'referral' in current_step:
-                # برای رفرال
-                state['step'] = 'referral_time_limit'
+                operation_type = 'referral'
             elif 'message' in current_step:
-                # برای پیام
-                state['step'] = 'message_time_limit'
+                operation_type = 'message'
             elif 'react' in current_step:
-                # برای ری‌اکشن
-                state['step'] = 'react_time_limit'
+                operation_type = 'react'
             elif 'view' in current_step:
-                # برای سین
-                state['step'] = 'view_time_limit'
+                operation_type = 'view'
             elif 'block' in current_step:
-                # برای بلاک
-                state['step'] = 'block_time_limit'
+                operation_type = 'block'
             elif 'unblock' in current_step:
-                # برای انبلاک
-                state['step'] = 'unblock_time_limit'
+                operation_type = 'unblock'
+            elif 'scenario' in current_step:
+                operation_type = 'scenario'
             
-            # ایجاد یک event ساختگی با متن /skip
-            class FakeMessage:
-                def __init__(self):
-                    self.text = "/skip"
+            if not operation_type:
+                await event.answer("❌ خطا در تشخیص نوع عملیات", alert=True)
+                return
             
-            class FakeEvent:
-                def __init__(self, sender_id, message, original_event):
-                    self.sender_id = sender_id
-                    self.message = message
-                    self._respond = original_event.respond
-                    self._edit = original_event.edit
-                    self._answer = original_event.answer
+            # ذخیره تاخیر سفارشی به عنوان None (بدون محدودیت)
+            state['custom_delay'] = None
+            state['time_limit_text'] = ''
+            
+            # اجرای عملیات بر اساس نوع
+            if operation_type == 'join':
+                channel_link = state['channel_link']
+                results_text, progress_msg, results = await self._execute_bulk_operation(
+                    event, user_id, state, 'join',
+                    self.channel_manager.bulk_join,
+                    channel_link=channel_link
+                )
+                await progress_msg.edit(
+                    results_text,
+                    buttons=[
+                        [Button.inline("🔗 جوین مجدد", b"join_channel")],
+                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
+                    ]
+                )
+                await self.db.log_action('bulk_join', user_id, f"{channel_link} - {results['success']}/{len(state['selected_accounts'])}")
+                del self.user_states[user_id]
                 
-                async def respond(self, *args, **kwargs):
-                    return await self._respond(*args, **kwargs)
+            elif operation_type == 'leave':
+                channel_link = state['channel_link']
+                results_text, progress_msg, results = await self._execute_bulk_operation(
+                    event, user_id, state, 'leave',
+                    self.channel_manager.bulk_leave,
+                    channel_link=channel_link
+                )
+                await progress_msg.edit(
+                    results_text,
+                    buttons=[
+                        [Button.inline("🚪 لفت مجدد", b"leave_channel")],
+                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
+                    ]
+                )
+                await self.db.log_action('bulk_leave', user_id, f"{channel_link} - {results['success']}/{len(state['selected_accounts'])}")
+                del self.user_states[user_id]
                 
-                async def edit(self, *args, **kwargs):
-                    return await self._edit(*args, **kwargs)
+            elif operation_type == 'scenario':
+                # برای سناریو از کد قبلی استفاده می‌کنیم
+                # فعلاً پیام می‌دیم که از /skip استفاده کنه
+                await event.answer("⚠️ لطفاً /skip را تایپ کنید", alert=True)
                 
-                async def answer(self, *args, **kwargs):
-                    return await self._answer(*args, **kwargs)
+            else:
+                # برای بقیه عملیات‌ها که هنوز پیاده‌سازی نشدن
+                await event.answer("⚠️ لطفاً /skip را تایپ کنید", alert=True)
             
-            fake_event = FakeEvent(user_id, FakeMessage(), event)
-            
-            # فراخوانی handler اصلی
-            await handle_text_message(fake_event)
             await event.answer("✅ بدون محدودیت زمانی")
         
         @self.bot.on(events.CallbackQuery(pattern=b"cancel_scenario"))

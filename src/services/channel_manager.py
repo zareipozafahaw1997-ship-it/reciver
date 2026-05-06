@@ -333,7 +333,7 @@ class ChannelManager:
                 await client.disconnect()
     
     async def bulk_join(self, session_paths: List[str], channel_link: str, 
-                       progress_callback=None) -> Dict[str, any]:
+                       progress_callback=None, workers: int = 1, custom_delay: int = None) -> Dict[str, any]:
         """
         جوین دسته‌جمعی با چند اکانت (با تاخیر و تایمر)
         
@@ -341,6 +341,8 @@ class ChannelManager:
             session_paths: لیست مسیر فایل‌های سشن
             channel_link: لینک کانال یا گروه
             progress_callback: تابع callback برای نمایش پیشرفت
+            workers: تعداد اکانت‌های همزمان
+            custom_delay: تاخیر سفارشی (None = استفاده از تاخیر پیش‌فرض)
             
         Returns:
             دیکشنری حاوی نتایج
@@ -353,37 +355,52 @@ class ChannelManager:
         
         total = len(session_paths)
         
-        for index, session_path in enumerate(session_paths, 1):
-            # محاسبه تاخیر تصادفی
-            delay = Config.DELAY_BETWEEN_ACTIONS + random.randint(0, Config.DELAY_RANDOM_RANGE)
+        # اجرای همزمان با worker
+        for i in range(0, total, workers):
+            batch = session_paths[i:i + workers]
+            tasks = []
             
-            # اگر callback داریم، پیشرفت رو نمایش بدیم
-            if progress_callback:
-                await progress_callback(index, total, f"در حال جوین اکانت {index}/{total}...")
+            for session_path in batch:
+                tasks.append(self.join_channel(session_path, channel_link))
             
-            logger.info(f"جوین اکانت {index}/{total} - تاخیر: {delay}s")
+            # اجرای همزمان batch
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            result = await self.join_channel(session_path, channel_link)
+            # پردازش نتایج
+            for j, result in enumerate(batch_results):
+                index = i + j + 1
+                
+                if isinstance(result, Exception):
+                    result = {'success': False, 'message': str(result)}
+                
+                if result['success']:
+                    results['success'] += 1
+                else:
+                    results['failed'] += 1
+                
+                results['details'].append({
+                    'session': Path(batch[j]).name,
+                    'result': result
+                })
+                
+                # بروزرسانی پیشرفت
+                if progress_callback:
+                    await progress_callback(index, total, f"در حال جوین اکانت {index}/{total}...")
             
-            if result['success']:
-                results['success'] += 1
-            else:
-                results['failed'] += 1
-            
-            results['details'].append({
-                'session': Path(session_path).name,
-                'result': result
-            })
-            
-            # تاخیر بین عملیات‌ها (به جز آخرین مورد)
-            if index < total:
-                logger.info(f"صبر {delay} ثانیه قبل از عملیات بعدی...")
+            # تاخیر بین batch‌ها (به جز آخرین batch)
+            if i + workers < total:
+                if custom_delay is not None:
+                    delay = custom_delay
+                else:
+                    delay = Config.DELAY_BETWEEN_ACTIONS + random.randint(0, Config.DELAY_RANDOM_RANGE)
+                
+                logger.info(f"صبر {delay} ثانیه قبل از batch بعدی...")
                 await asyncio.sleep(delay)
         
         return results
     
     async def bulk_leave(self, session_paths: List[str], channel_link: str,
-                        progress_callback=None) -> Dict[str, any]:
+                        progress_callback=None, workers: int = 1, custom_delay: int = None) -> Dict[str, any]:
         """
         لفت دسته‌جمعی با چند اکانت (با تاخیر و تایمر)
         
@@ -391,6 +408,8 @@ class ChannelManager:
             session_paths: لیست مسیر فایل‌های سشن
             channel_link: لینک کانال یا گروه
             progress_callback: تابع callback برای نمایش پیشرفت
+            workers: تعداد اکانت‌های همزمان
+            custom_delay: تاخیر سفارشی (None = استفاده از تاخیر پیش‌فرض)
             
         Returns:
             دیکشنری حاوی نتایج
@@ -403,31 +422,46 @@ class ChannelManager:
         
         total = len(session_paths)
         
-        for index, session_path in enumerate(session_paths, 1):
-            # محاسبه تاخیر تصادفی
-            delay = Config.DELAY_BETWEEN_ACTIONS + random.randint(0, Config.DELAY_RANDOM_RANGE)
+        # اجرای همزمان با worker
+        for i in range(0, total, workers):
+            batch = session_paths[i:i + workers]
+            tasks = []
             
-            # اگر callback داریم، پیشرفت رو نمایش بدیم
-            if progress_callback:
-                await progress_callback(index, total, f"در حال لفت اکانت {index}/{total}...")
+            for session_path in batch:
+                tasks.append(self.leave_channel(session_path, channel_link))
             
-            logger.info(f"لفت اکانت {index}/{total} - تاخیر: {delay}s")
+            # اجرای همزمان batch
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            result = await self.leave_channel(session_path, channel_link)
+            # پردازش نتایج
+            for j, result in enumerate(batch_results):
+                index = i + j + 1
+                
+                if isinstance(result, Exception):
+                    result = {'success': False, 'message': str(result)}
+                
+                if result['success']:
+                    results['success'] += 1
+                else:
+                    results['failed'] += 1
+                
+                results['details'].append({
+                    'session': Path(batch[j]).name,
+                    'result': result
+                })
+                
+                # بروزرسانی پیشرفت
+                if progress_callback:
+                    await progress_callback(index, total, f"در حال لفت اکانت {index}/{total}...")
             
-            if result['success']:
-                results['success'] += 1
-            else:
-                results['failed'] += 1
-            
-            results['details'].append({
-                'session': Path(session_path).name,
-                'result': result
-            })
-            
-            # تاخیر بین عملیات‌ها (به جز آخرین مورد)
-            if index < total:
-                logger.info(f"صبر {delay} ثانیه قبل از عملیات بعدی...")
+            # تاخیر بین batch‌ها (به جز آخرین batch)
+            if i + workers < total:
+                if custom_delay is not None:
+                    delay = custom_delay
+                else:
+                    delay = Config.DELAY_BETWEEN_ACTIONS + random.randint(0, Config.DELAY_RANDOM_RANGE)
+                
+                logger.info(f"صبر {delay} ثانیه قبل از batch بعدی...")
                 await asyncio.sleep(delay)
         
         return results
