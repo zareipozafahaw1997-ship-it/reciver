@@ -3845,13 +3845,13 @@ class BotHandler:
         @self.bot.on(events.CallbackQuery(pattern=b"skip_time_limit"))
         async def skip_time_limit_callback(event):
             """رد کردن محدودیت زمانی"""
-            await event.answer("✅ بدون محدودیت زمانی")
-            
             user_id = event.sender_id
             
             if user_id not in self.user_states:
                 await event.answer("⚠️ لطفاً دوباره عملیات را شروع کنید", alert=True)
                 return
+            
+            await event.answer()  # بستن notification
             
             state = self.user_states[user_id]
             current_step = state.get('step', '')
