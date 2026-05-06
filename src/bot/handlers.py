@@ -4035,8 +4035,9 @@ class BotHandler:
                 del self.user_states[user_id]
                 
             elif 'scenario' in current_step:
-                # برای سناریو فعلاً پیام میدیم
-                await event.answer("⚠️ لطفاً /skip را تایپ کنید", alert=True)
+                # برای سناریو، کاربر باید /skip رو تایپ کنه
+                # چون کد سناریو پیچیده‌تر است و در پس‌زمینه اجرا میشه
+                await event.answer("⚠️ لطفاً /skip را تایپ کنید یا عدد دقیقه وارد کنید", alert=True)
             
             else:
                 await event.answer("❌ خطا در تشخیص نوع عملیات", alert=True)
