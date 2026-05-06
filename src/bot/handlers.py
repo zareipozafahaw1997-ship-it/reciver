@@ -3845,6 +3845,8 @@ class BotHandler:
         @self.bot.on(events.CallbackQuery(pattern=b"skip_time_limit"))
         async def skip_time_limit_callback(event):
             """رد کردن محدودیت زمانی"""
+            await event.answer("✅ بدون محدودیت زمانی")
+            
             user_id = event.sender_id
             
             if user_id not in self.user_states:
@@ -3854,38 +3856,12 @@ class BotHandler:
             state = self.user_states[user_id]
             current_step = state.get('step', '')
             
-            # مستقیم پردازش می‌کنیم بدون fake event
-            # تشخیص نوع عملیات
-            operation_type = None
-            if 'join' in current_step:
-                operation_type = 'join'
-            elif 'leave' in current_step:
-                operation_type = 'leave'
-            elif 'referral' in current_step:
-                operation_type = 'referral'
-            elif 'message' in current_step:
-                operation_type = 'message'
-            elif 'react' in current_step:
-                operation_type = 'react'
-            elif 'view' in current_step:
-                operation_type = 'view'
-            elif 'block' in current_step:
-                operation_type = 'block'
-            elif 'unblock' in current_step:
-                operation_type = 'unblock'
-            elif 'scenario' in current_step:
-                operation_type = 'scenario'
-            
-            if not operation_type:
-                await event.answer("❌ خطا در تشخیص نوع عملیات", alert=True)
-                return
-            
             # ذخیره تاخیر سفارشی به عنوان None (بدون محدودیت)
             state['custom_delay'] = None
             state['time_limit_text'] = ''
             
-            # اجرای عملیات بر اساس نوع
-            if operation_type == 'join':
+            # تشخیص نوع عملیات و اجرا
+            if 'join' in current_step:
                 channel_link = state['channel_link']
                 results_text, progress_msg, results = await self._execute_bulk_operation(
                     event, user_id, state, 'join',
@@ -3902,7 +3878,7 @@ class BotHandler:
                 await self.db.log_action('bulk_join', user_id, f"{channel_link} - {results['success']}/{len(state['selected_accounts'])}")
                 del self.user_states[user_id]
                 
-            elif operation_type == 'leave':
+            elif 'leave' in current_step:
                 channel_link = state['channel_link']
                 results_text, progress_msg, results = await self._execute_bulk_operation(
                     event, user_id, state, 'leave',
@@ -3919,16 +3895,117 @@ class BotHandler:
                 await self.db.log_action('bulk_leave', user_id, f"{channel_link} - {results['success']}/{len(state['selected_accounts'])}")
                 del self.user_states[user_id]
                 
-            elif operation_type == 'scenario':
-                # برای سناریو از کد قبلی استفاده می‌کنیم
-                # فعلاً پیام می‌دیم که از /skip استفاده کنه
-                await event.answer("⚠️ لطفاً /skip را تایپ کنید", alert=True)
+            elif 'referral' in current_step:
+                bot_username = state['bot_username']
+                start_param = state['start_param']
+                click_button = state.get('click_button')
                 
-            else:
-                # برای بقیه عملیات‌ها که هنوز پیاده‌سازی نشدن
+                results_text, progress_msg, results = await self._execute_bulk_operation(
+                    event, user_id, state, 'referral',
+                    self.referral_manager.bulk_start_bot,
+                    bot_username=bot_username,
+                    start_param=start_param,
+                    click_button=click_button
+                )
+                
+                # نمایش نتایج با جزئیات دکمه
+                if click_button and results.get('button_clicked', 0) > 0:
+                    results_text += f"\n🔘 دکمه کلیک شده: {results['button_clicked']}"
+                
+                await progress_msg.edit(
+                    results_text,
+                    buttons=[
+                        [Button.inline("🤖 استارت مجدد", b"start_referral")],
+                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
+                    ]
+                )
+                await self.db.log_action('bulk_referral', user_id, f"@{bot_username} - {results['success']}/{len(state['selected_accounts'])}")
+                del self.user_states[user_id]
+                
+            elif 'message' in current_step:
+                target = state['target']
+                message = state['message']
+                
+                results_text, progress_msg, results = await self._execute_bulk_operation(
+                    event, user_id, state, 'message',
+                    self.message_sender.bulk_send_message,
+                    target=target,
+                    message=message
+                )
+                await progress_msg.edit(
+                    results_text,
+                    buttons=[
+                        [Button.inline("💬 ارسال مجدد", b"send_message")],
+                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
+                    ]
+                )
+                await self.db.log_action('bulk_message', user_id, f"{target} - {results['success']}/{len(state['selected_accounts'])}")
+                del self.user_states[user_id]
+                
+            elif 'react' in current_step:
+                channel_link = state['channel_link']
+                message_id = state['message_id']
+                reaction_count = state.get('reaction_count', 5)
+                
+                results_text, progress_msg, results = await self._execute_bulk_operation(
+                    event, user_id, state, 'react',
+                    self.reaction_manager.bulk_react_and_view,
+                    channel_link=channel_link,
+                    message_id=message_id,
+                    reaction_count=reaction_count
+                )
+                await progress_msg.edit(
+                    results_text,
+                    buttons=[
+                        [Button.inline("❤️ ری‌اکشن مجدد", b"react_post")],
+                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
+                    ]
+                )
+                await self.db.log_action('bulk_react', user_id, f"{channel_link}/{message_id} - {results['success']}/{len(state['selected_accounts'])}")
+                del self.user_states[user_id]
+                
+            elif 'block' in current_step:
+                target = state['target']
+                
+                results_text, progress_msg, results = await self._execute_bulk_operation(
+                    event, user_id, state, 'block',
+                    self.block_manager.bulk_block,
+                    target=target
+                )
+                await progress_msg.edit(
+                    results_text,
+                    buttons=[
+                        [Button.inline("🚫 بلاک مجدد", b"block_user")],
+                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
+                    ]
+                )
+                await self.db.log_action('bulk_block', user_id, f"{target} - {results['success']}/{len(state['selected_accounts'])}")
+                del self.user_states[user_id]
+                
+            elif 'unblock' in current_step:
+                target = state['target']
+                
+                results_text, progress_msg, results = await self._execute_bulk_operation(
+                    event, user_id, state, 'unblock',
+                    self.block_manager.bulk_unblock,
+                    target=target
+                )
+                await progress_msg.edit(
+                    results_text,
+                    buttons=[
+                        [Button.inline("✅ انبلاک مجدد", b"block_user")],
+                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
+                    ]
+                )
+                await self.db.log_action('bulk_unblock', user_id, f"{target} - {results['success']}/{len(state['selected_accounts'])}")
+                del self.user_states[user_id]
+                
+            elif 'scenario' in current_step:
+                # برای سناریو فعلاً پیام میدیم
                 await event.answer("⚠️ لطفاً /skip را تایپ کنید", alert=True)
             
-            await event.answer("✅ بدون محدودیت زمانی")
+            else:
+                await event.answer("❌ خطا در تشخیص نوع عملیات", alert=True)
         
         @self.bot.on(events.CallbackQuery(pattern=b"cancel_scenario"))
         async def cancel_scenario_callback(event):
