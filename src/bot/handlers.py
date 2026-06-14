@@ -786,7 +786,8 @@ class BotHandler:
                      Button.inline("👥 لیچر", b"leecher")],
                     [Button.inline("🎨 اعمال پروفایل", b"apply_profiles")],
                     [Button.inline("📝 یادداشت‌های من", b"my_notes")],
-                    [Button.inline("⚙️ مدیریت ربات", b"bot_management")]
+                    [Button.inline("⚙️ مدیریت ربات", b"bot_management")],
+                    [Button.inline("👑 پنل ادمین", b"admin_panel")]
                 ]
                 
                 welcome_text = (
@@ -1949,7 +1950,8 @@ class BotHandler:
                      Button.inline("👥 لیچر", b"leecher")],
                     [Button.inline("🎨 اعمال پروفایل", b"apply_profiles")],
                     [Button.inline("📝 یادداشت‌های من", b"my_notes")],
-                    [Button.inline("⚙️ مدیریت ربات", b"bot_management")]
+                    [Button.inline("⚙️ مدیریت ربات", b"bot_management")],
+                    [Button.inline("👑 پنل ادمین", b"admin_panel")]
                 ]
             else:
                 # منوی محدود برای کاربران عادی (فقط افزودن اکانت)
