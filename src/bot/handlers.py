@@ -934,7 +934,7 @@ class BotHandler:
         async def admin_panel_callback(event):
             """پنل ادمین"""
             # فقط سازنده دسترسی داره
-            if not await self._check_creator_access(event):
+            if not await self._check_admin_access(event):
                 return
             
             await event.answer()
@@ -963,7 +963,7 @@ class BotHandler:
         async def admin_stats_callback(event):
             """نمایش آمار"""
             # فقط سازنده دسترسی داره
-            if not await self._check_creator_access(event):
+            if not await self._check_admin_access(event):
                 return
             
             await event.answer()
@@ -988,7 +988,7 @@ class BotHandler:
         async def admin_accounts_callback(event):
             """نمایش همه اکانت‌ها"""
             # فقط سازنده دسترسی داره
-            if not await self._check_creator_access(event):
+            if not await self._check_admin_access(event):
                 return
             
             await event.answer()
@@ -1202,7 +1202,7 @@ class BotHandler:
         async def admin_pending_callback(event):
             """نمایش کاربران در انتظار تایید"""
             # فقط سازنده دسترسی داره
-            if not await self._check_creator_access(event):
+            if not await self._check_admin_access(event):
                 return
             
             await event.answer()
@@ -1305,7 +1305,11 @@ class BotHandler:
         async def approve_command_handler(event):
             """تایید دسترسی کاربر با دستور"""
             # فقط سازنده می‌تونه تایید کنه
-            if event.sender_id not in Config.ADMIN_IDS:
+            is_creator = event.sender_id in Config.ADMIN_IDS
+            is_admin = await self.db.is_admin(event.sender_id)
+            if not is_creator and not is_admin:
+                await event.respond("⛔️ فقط ادمین‌ها و سازنده می‌توانند کاربر تایید کنند!")
+                return
                 await event.respond("⛔️ فقط سازنده می‌تواند کاربر تایید کند!")
                 return
             
@@ -1356,7 +1360,11 @@ class BotHandler:
         async def reject_command_handler(event):
             """رد دسترسی کاربر با دستور"""
             # فقط سازنده می‌تونه رد کنه
-            if event.sender_id not in Config.ADMIN_IDS:
+            is_creator = event.sender_id in Config.ADMIN_IDS
+            is_admin = await self.db.is_admin(event.sender_id)
+            if not is_creator and not is_admin:
+                await event.respond("⛔️ فقط ادمین‌ها و سازنده می‌توانند درخواست کاربر را رد کنند!")
+                return
                 await event.respond("⛔️ فقط سازنده می‌تواند کاربر رد کند!")
                 return
             
