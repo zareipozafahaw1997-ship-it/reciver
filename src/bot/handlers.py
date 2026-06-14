@@ -2626,7 +2626,7 @@ class BotHandler:
                 state['scenario_summary'] = f"🔗 **عملیات: جوین کانال/گروه**\n📢 کانال: {channel_link}"
                 
                 # نمایش دکمه‌های انتخاب کشور
-                countries = await self.db.get_active_accounts_countries(user_id)
+                countries = await self.db.get_countries(user_id)
                 if len(countries) > 1:
                     state['step'] = 'scenario_country'
                     country_text, buttons = self._create_country_buttons(countries)
@@ -2760,7 +2760,7 @@ class BotHandler:
                 state['scenario_summary'] = f"🚪 **عملیات: لفت کانال/گروه**\n📢 کانال: {channel_link}"
                 
                 # نمایش دکمه‌های انتخاب کشور
-                countries = await self.db.get_active_accounts_countries(user_id)
+                countries = await self.db.get_countries(user_id)
                 if len(countries) > 1:
                     state['step'] = 'scenario_country'
                     country_text, buttons = self._create_country_buttons(countries)
@@ -2911,7 +2911,7 @@ class BotHandler:
                 state['scenario_summary'] = f"🤖 **عملیات: استارت رفرال**\n🤖 ربات: @{bot_username}\n🔑 پارامتر: {start_param}"
                 
                 # نمایش دکمه‌های انتخاب کشور
-                countries = await self.db.get_active_accounts_countries(user_id)
+                countries = await self.db.get_countries(user_id)
                 if len(countries) > 1:
                     state['step'] = 'scenario_country'
                     country_text, buttons = self._create_country_buttons(countries)
@@ -3203,7 +3203,7 @@ class BotHandler:
                     state['scenario_summary'] = f"❤️ **عملیات: ری‌اکشن و سین پست**\n📢 کانال: {channel_link}\n📨 پست: {message_id}"
                     
                     # نمایش دکمه‌های انتخاب کشور
-                    countries = await self.db.get_active_accounts_countries(user_id)
+                    countries = await self.db.get_countries(user_id)
                     if len(countries) > 1:
                         state['step'] = 'scenario_country'
                         country_text, buttons = self._create_country_buttons(countries)
@@ -3366,7 +3366,7 @@ class BotHandler:
                     state['scenario_summary'] = f"👁 **عملیات: سین پیام بدون ری‌اکشن**\n📢 کانال: {channel_link}\n📨 پست: {message_id}"
                     
                     # نمایش دکمه‌های انتخاب کشور
-                    countries = await self.db.get_active_accounts_countries(user_id)
+                    countries = await self.db.get_countries(user_id)
                     if len(countries) > 1:
                         state['step'] = 'scenario_country'
                         country_text, buttons = self._create_country_buttons(countries)
