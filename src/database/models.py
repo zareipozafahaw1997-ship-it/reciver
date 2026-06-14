@@ -568,6 +568,8 @@ class Database:
     
     async def get_scenario_progress(self, user_id: int, scenario_text: str) -> Optional[Dict[str, Any]]:
         """دریافت پیشرفت سناریو"""
+        if not scenario_text:
+            return None
         try:
             import hashlib
             scenario_hash = hashlib.md5(scenario_text.encode()).hexdigest()
@@ -588,6 +590,8 @@ class Database:
     
     async def delete_scenario_progress(self, user_id: int, scenario_text: str) -> bool:
         """حذف پیشرفت سناریو"""
+        if not scenario_text:
+            return False
         try:
             import hashlib
             scenario_hash = hashlib.md5(scenario_text.encode()).hexdigest()
