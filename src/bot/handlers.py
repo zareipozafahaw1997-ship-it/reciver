@@ -4163,13 +4163,20 @@ class BotHandler:
                 total = len(selected_accounts)
                 scenario_text = state.get('scenario_text', '')
                 
+                is_tree_referral = '{parent_ref}' in scenario_text or '{parent_ref_id}' in scenario_text
+                if is_tree_referral:
+                    workers = 1
+                
                 # ایجاد flag برای لغو و توقف عملیات
                 cancel_flag = {'cancelled': False, 'paused': False}
                 self.running_operations[user_id] = cancel_flag
                 
                 # ارسال پیام شروع با دکمه‌های کنترل
                 resume_text = f"▶️ ادامه از اکانت {start_index + 1}\n" if resume_mode else ""
-                worker_text = f"⚡ همزمان: {workers} اکانت\n" if workers > 1 else ""
+                if is_tree_referral:
+                    worker_text = "🌲 رفرال درختی: اجرای تک‌به‌تک (مجموعه زنجیره‌ای)\n"
+                else:
+                    worker_text = f"⚡ همزمان: {workers} اکانت\n" if workers > 1 else ""
                 
                 # تعیین تاخیر نهایی
                 if custom_delay is not None:
@@ -4196,6 +4203,7 @@ class BotHandler:
                 # تابع async برای اجرای در پس‌زمینه
                 async def run_scenario_background():
                     used_sessions = set()
+                    extracted_codes = {}
                     
                     try:
                         # اجرای سناریو با قفل per-session و worker pool
@@ -4295,13 +4303,20 @@ class BotHandler:
                                     else:
                                         bot_username = state['bot_username']
                                         scenario = state['scenario']
+                                        
+                                        parent_ref = None
+                                        if is_tree_referral:
+                                            parent_ref = self.bot_automation.resolve_parent_ref(scenario_text, index - 1, selected_accounts, extracted_codes)
+                                        
                                         result = await self.bot_automation.execute_scenario(
-                                            session_path, bot_username, scenario, db=self.db
+                                            session_path, bot_username, scenario, db=self.db, parent_ref=parent_ref
                                         )
                                     
                                     async with results['lock']:
                                         if result['success']:
                                             results['success'] += 1
+                                            if result.get('extracted_ref_code'):
+                                                extracted_codes[session_path] = result['extracted_ref_code']
                                         elif result.get('invalid_session'):
                                             results['failed'] += 1
                                             logger.warning(f"سشن نامعتبر غیرفعال شد: {session_path}")
