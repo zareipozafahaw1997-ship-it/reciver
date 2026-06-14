@@ -80,9 +80,10 @@ class BotAutomation:
         return text
 
     @staticmethod
-    def resolve_parent_ref(scenario_text: str, idx: int, selected_accounts: list, extracted_codes: dict) -> Optional[str]:
+    @staticmethod
+    def resolve_parent_ref(scenario_text: str, idx: int, selected_accounts: list, extracted_codes: dict, successful_sessions: list) -> Optional[str]:
         """
-        محاسبه رفرال والد بر اساس موقعیت در زنجیره یا درخت
+        محاسبه رفرال والد بر اساس موقعیت در زنجیره یا درخت (فقط با شمارش اکانت‌های موفق)
         """
         pattern = r'\{(parent_ref(?:_id)?)(?::(chain|tree):(\d+))?(?:\|([a-zA-Z0-9_-]+))?\}'
         match = re.search(pattern, scenario_text)
@@ -93,9 +94,7 @@ class BotAutomation:
         ref_val = int(match.group(3)) if match.group(3) else 3
         root_ref = match.group(4) or ''
         
-        active_sessions = [acc.session_path for acc in selected_accounts]
-        
-        if idx == 0:
+        if idx == 0 or not successful_sessions:
             return root_ref
         
         if ref_type == 'chain':
@@ -104,14 +103,14 @@ class BotAutomation:
             if pos == 0:
                 return root_ref
             else:
-                parent_session = active_sessions[idx - 1]
+                parent_session = successful_sessions[idx - 1]
                 return extracted_codes.get(parent_session, root_ref)
                 
         elif ref_type == 'tree':
             M = ref_val
             parent_idx = (idx - 1) // M
-            if parent_idx < len(active_sessions):
-                parent_session = active_sessions[parent_idx]
+            if parent_idx < len(successful_sessions):
+                parent_session = successful_sessions[parent_idx]
                 return extracted_codes.get(parent_session, root_ref)
             else:
                 return root_ref
@@ -177,9 +176,8 @@ class BotAutomation:
             smart_delay_enabled = False  # حالت صبر هوشمند
             smart_delay_timeout = 20    # timeout پیش‌فرض برای smart_delay
             
-            # اجرای هر مرحله
+            is_new_user = True
             extracted_ref_code = None
-            
             # اجرای هر مرحله
             for step_num, step in enumerate(scenario, 1):
                 action = step.get('action')
@@ -195,6 +193,16 @@ class BotAutomation:
                 
                 try:
                     if action == 'start':
+                        # بررسی اینکه آیا اکانت قبلاً ربات را استارت زده است
+                        try:
+                            history = await client.get_messages(bot, limit=1)
+                            if history and len(history) > 0:
+                                is_new_user = False
+                                logger.info(f"اکانت {session_path} قبلاً ربات @{bot_username} را استارت زده است.")
+                                executed_steps.append("ℹ️ این اکانت قبلاً ربات را استارت زده است (به عنوان رفرال جدید والد شمرده نمی‌شود)")
+                        except Exception as e:
+                            logger.warning(f"خطا در بررسی تاریخچه ربات: {e}")
+                        
                         # ارسال /start با پارامتر
                         await client.send_message(bot, f'/start {value}')
                         executed_steps.append(f"✅ استارت با رفرال: {value}")
@@ -1070,7 +1078,8 @@ class BotAutomation:
                 'message': 'سناریو با موفقیت اجرا شد',
                 'bot_username': bot_username,
                 'executed_steps': executed_steps,
-                'extracted_ref_code': extracted_ref_code
+                'extracted_ref_code': extracted_ref_code,
+                'is_new_user': is_new_user
             }
             
         except Exception as e:
