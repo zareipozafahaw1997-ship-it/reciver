@@ -4204,6 +4204,8 @@ class BotHandler:
                 async def run_scenario_background():
                     used_sessions = set()
                     extracted_codes = {}
+                    successful_sessions = []
+                    extracted_codes = {}
                     
                     try:
                         # اجرای سناریو با قفل per-session و worker pool
@@ -4306,7 +4308,8 @@ class BotHandler:
                                         
                                         parent_ref = None
                                         if is_tree_referral:
-                                            parent_ref = self.bot_automation.resolve_parent_ref(scenario_text, index - 1, selected_accounts, extracted_codes)
+                                            idx = len(successful_sessions)
+                                            parent_ref = self.bot_automation.resolve_parent_ref(scenario_text, idx, selected_accounts, extracted_codes, successful_sessions)
                                         
                                         result = await self.bot_automation.execute_scenario(
                                             session_path, bot_username, scenario, db=self.db, parent_ref=parent_ref
@@ -4317,6 +4320,8 @@ class BotHandler:
                                             results['success'] += 1
                                             if result.get('extracted_ref_code'):
                                                 extracted_codes[session_path] = result['extracted_ref_code']
+                                            if result.get('is_new_user', True):
+                                                successful_sessions.append(session_path)
                                         elif result.get('invalid_session'):
                                             results['failed'] += 1
                                             logger.warning(f"سشن نامعتبر غیرفعال شد: {session_path}")
