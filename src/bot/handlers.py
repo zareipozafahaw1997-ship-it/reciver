@@ -2619,19 +2619,33 @@ class BotHandler:
                     del self.user_states[user_id]
                     return
                 
-                # ذخیره اطلاعات و پرسیدن تعداد اکانت
+                # ذخیره اطلاعات و انتقال به فرآیند رفرال/کشور پیشرفته
                 state['channel_link'] = channel_link
                 state['active_accounts'] = active_accounts
-                state['step'] = 'join_count'
+                state['operation_type'] = 'join_channel'
+                state['scenario_summary'] = f"🔗 **عملیات: جوین کانال/گروه**\n📢 کانال: {channel_link}"
                 
-                await event.respond(
-                    f"📊 **انتخاب تعداد اکانت**\n\n"
-                    f"شما {len(active_accounts)} اکانت فعال دارید.\n\n"
-                    f"چند تا اکانت برای جوین استفاده شود؟\n\n"
-                    f"💡 عدد ارسال کنید (مثلاً 5) یا:\n"
-                    f"• /all برای همه اکانت‌ها",
-                    buttons=Button.inline("❌ لغو", b"cancel")
-                )
+                # نمایش دکمه‌های انتخاب کشور
+                countries = await self.db.get_active_accounts_countries(user_id)
+                if len(countries) > 1:
+                    state['step'] = 'scenario_country'
+                    country_text, buttons = self._create_country_buttons(countries)
+                    await event.respond(country_text, buttons=buttons)
+                else:
+                    state['selected_country'] = None
+                    state['step'] = 'scenario_count'
+                    await event.respond(
+                        f"📊 **انتخاب تعداد اکانت**\n\n"
+                        f"{state['scenario_summary']}\n\n"
+                        f"شما {len(active_accounts)} اکانت فعال دارید.\n\n"
+                        f"چند تا اکانت برای جوین کانال استفاده شود؟\n\n"
+                        f"💡 **گزینه‌ها:**\n"
+                        f"• عدد بفرست (مثلاً `5`)\n"
+                        f"• `/all` - همه اکانت‌ها\n"
+                        f"• `/from 70` - از اکانت 70\n"
+                        f"• `/from 70 to 100` - از 70 تا 100",
+                        buttons=Button.inline("❌ لغو", b"cancel")
+                    )
             
             elif step == 'join_count':
                 # دریافت تعداد اکانت
@@ -2739,19 +2753,33 @@ class BotHandler:
                     del self.user_states[user_id]
                     return
                 
-                # ذخیره اطلاعات و پرسیدن تعداد اکانت
+                # ذخیره اطلاعات و انتقال به فرآیند رفرال/کشور پیشرفته
                 state['channel_link'] = channel_link
                 state['active_accounts'] = active_accounts
-                state['step'] = 'leave_count'
+                state['operation_type'] = 'leave_channel'
+                state['scenario_summary'] = f"🚪 **عملیات: لفت کانال/گروه**\n📢 کانال: {channel_link}"
                 
-                await event.respond(
-                    f"📊 **انتخاب تعداد اکانت**\n\n"
-                    f"شما {len(active_accounts)} اکانت فعال دارید.\n\n"
-                    f"چند تا اکانت برای لفت استفاده شود؟\n\n"
-                    f"💡 عدد ارسال کنید (مثلاً 5) یا:\n"
-                    f"• /all برای همه اکانت‌ها",
-                    buttons=Button.inline("❌ لغو", b"cancel")
-                )
+                # نمایش دکمه‌های انتخاب کشور
+                countries = await self.db.get_active_accounts_countries(user_id)
+                if len(countries) > 1:
+                    state['step'] = 'scenario_country'
+                    country_text, buttons = self._create_country_buttons(countries)
+                    await event.respond(country_text, buttons=buttons)
+                else:
+                    state['selected_country'] = None
+                    state['step'] = 'scenario_count'
+                    await event.respond(
+                        f"📊 **انتخاب تعداد اکانت**\n\n"
+                        f"{state['scenario_summary']}\n\n"
+                        f"شما {len(active_accounts)} اکانت فعال دارید.\n\n"
+                        f"چند تا اکانت برای لفت استفاده شود؟\n\n"
+                        f"💡 **گزینه‌ها:**\n"
+                        f"• عدد بفرست (مثلاً `5`)\n"
+                        f"• `/all` - همه اکانت‌ها\n"
+                        f"• `/from 70` - از اکانت 70\n"
+                        f"• `/from 70 to 100` - از 70 تا 100",
+                        buttons=Button.inline("❌ لغو", b"cancel")
+                    )
             
             elif step == 'leave_count':
                 # دریافت تعداد اکانت
@@ -2875,20 +2903,34 @@ class BotHandler:
                     del self.user_states[user_id]
                     return
                 
-                # ذخیره اطلاعات و پرسیدن تعداد اکانت
+                # ذخیره اطلاعات و انتقال به فرآیند رفرال/کشور پیشرفته
                 state['bot_username'] = bot_username
                 state['start_param'] = start_param
                 state['active_accounts'] = active_accounts
-                state['step'] = 'referral_count'
+                state['operation_type'] = 'start_referral'
+                state['scenario_summary'] = f"🤖 **عملیات: استارت رفرال**\n🤖 ربات: @{bot_username}\n🔑 پارامتر: {start_param}"
                 
-                await event.respond(
-                    f"📊 **انتخاب تعداد اکانت**\n\n"
-                    f"شما {len(active_accounts)} اکانت فعال دارید.\n\n"
-                    f"چند تا اکانت برای استارت رفرال استفاده شود؟\n\n"
-                    f"💡 عدد ارسال کنید (مثلاً 5) یا:\n"
-                    f"• /all برای همه اکانت‌ها",
-                    buttons=Button.inline("❌ لغو", b"cancel")
-                )
+                # نمایش دکمه‌های انتخاب کشور
+                countries = await self.db.get_active_accounts_countries(user_id)
+                if len(countries) > 1:
+                    state['step'] = 'scenario_country'
+                    country_text, buttons = self._create_country_buttons(countries)
+                    await event.respond(country_text, buttons=buttons)
+                else:
+                    state['selected_country'] = None
+                    state['step'] = 'scenario_count'
+                    await event.respond(
+                        f"📊 **انتخاب تعداد اکانت**\n\n"
+                        f"{state['scenario_summary']}\n\n"
+                        f"شما {len(active_accounts)} اکانت فعال دارید.\n\n"
+                        f"چند تا اکانت برای استارت رفرال استفاده شود؟\n\n"
+                        f"💡 **گزینه‌ها:**\n"
+                        f"• عدد بفرست (مثلاً `5`)\n"
+                        f"• `/all` - همه اکانت‌ها\n"
+                        f"• `/from 70` - از اکانت 70\n"
+                        f"• `/from 70 to 100` - از 70 تا 100",
+                        buttons=Button.inline("❌ لغو", b"cancel")
+                    )
             
             elif step == 'referral_count':
                 # دریافت تعداد اکانت
@@ -3153,20 +3195,34 @@ class BotHandler:
                         del self.user_states[user_id]
                         return
                     
-                    # ذخیره اطلاعات و پرسیدن تعداد اکانت
+                    # ذخیره اطلاعات و انتقال به فرآیند رفرال/کشور پیشرفته
                     state['channel_link'] = channel_link
                     state['message_id'] = message_id
                     state['active_accounts'] = active_accounts
-                    state['step'] = 'react_count'
+                    state['operation_type'] = 'react'
+                    state['scenario_summary'] = f"❤️ **عملیات: ری‌اکشن و سین پست**\n📢 کانال: {channel_link}\n📨 پست: {message_id}"
                     
-                    await event.respond(
-                        f"📊 **انتخاب تعداد اکانت**\n\n"
-                        f"شما {len(active_accounts)} اکانت فعال دارید.\n\n"
-                        f"چند تا اکانت برای ری‌اکشن استفاده شود؟\n\n"
-                        f"💡 عدد ارسال کنید (مثلاً 5) یا:\n"
-                        f"• /all برای همه اکانت‌ها",
-                        buttons=Button.inline("❌ لغو", b"cancel")
-                    )
+                    # نمایش دکمه‌های انتخاب کشور
+                    countries = await self.db.get_active_accounts_countries(user_id)
+                    if len(countries) > 1:
+                        state['step'] = 'scenario_country'
+                        country_text, buttons = self._create_country_buttons(countries)
+                        await event.respond(country_text, buttons=buttons)
+                    else:
+                        state['selected_country'] = None
+                        state['step'] = 'scenario_count'
+                        await event.respond(
+                            f"📊 **انتخاب تعداد اکانت**\n\n"
+                            f"{state['scenario_summary']}\n\n"
+                            f"شما {len(active_accounts)} اکانت فعال دارید.\n\n"
+                             f"چند تا اکانت برای ری‌اکشن استفاده شود؟\n\n"
+                             f"💡 **گزینه‌ها:**\n"
+                             f"• عدد بفرست (مثلاً `5`)\n"
+                             f"• `/all` - همه اکانت‌ها\n"
+                             f"• `/from 70` - از اکانت 70\n"
+                             f"• `/from 70 to 100` - از 70 تا 100",
+                             buttons=Button.inline("❌ لغو", b"cancel")
+                         )
                     
                 except (ValueError, IndexError) as e:
                     await event.respond(
@@ -3302,20 +3358,34 @@ class BotHandler:
                         del self.user_states[user_id]
                         return
                     
-                    # ذخیره اطلاعات و پرسیدن تعداد اکانت
+                    # ذخیره اطلاعات و انتقال به فرآیند رفرال/کشور پیشرفته
                     state['channel_link'] = channel_link
                     state['message_id'] = message_id
                     state['active_accounts'] = active_accounts
-                    state['step'] = 'view_only_count'
+                    state['operation_type'] = 'view_only'
+                    state['scenario_summary'] = f"👁 **عملیات: سین پیام بدون ری‌اکشن**\n📢 کانال: {channel_link}\n📨 پست: {message_id}"
                     
-                    await event.respond(
-                        f"📊 **انتخاب تعداد اکانت**\n\n"
-                        f"شما {len(active_accounts)} اکانت فعال دارید.\n\n"
-                        f"چند تا اکانت برای سین استفاده شود؟\n\n"
-                        f"💡 عدد ارسال کنید (مثلاً 5) یا:\n"
-                        f"• /all برای همه اکانت‌ها",
-                        buttons=Button.inline("❌ لغو", b"cancel")
-                    )
+                    # نمایش دکمه‌های انتخاب کشور
+                    countries = await self.db.get_active_accounts_countries(user_id)
+                    if len(countries) > 1:
+                        state['step'] = 'scenario_country'
+                        country_text, buttons = self._create_country_buttons(countries)
+                        await event.respond(country_text, buttons=buttons)
+                    else:
+                        state['selected_country'] = None
+                        state['step'] = 'scenario_count'
+                        await event.respond(
+                            f"📊 **انتخاب تعداد اکانت**\n\n"
+                            f"{state['scenario_summary']}\n\n"
+                            f"شما {len(active_accounts)} اکانت فعال دارید.\n\n"
+                            f"چند تا اکانت برای سین استفاده شود؟\n\n"
+                            f"💡 **گزینه‌ها:**\n"
+                            f"• عدد بفرست (مثلاً `5`)\n"
+                            f"• `/all` - همه اکانت‌ها\n"
+                            f"• `/from 70` - از اکانت 70\n"
+                            f"• `/from 70 to 100` - از 70 تا 100",
+                            buttons=Button.inline("❌ لغو", b"cancel")
+                        )
                     
                 except (ValueError, IndexError) as e:
                     await event.respond(
@@ -4200,12 +4270,131 @@ class BotHandler:
                     ]
                 )
                 
+                # دریافت نوع عملیات
+                op_type = state.get('operation_type', 'scenario')
+                
+                # تابع اجرای عملیات‌های دسته‌جمعی ساده در پس‌زمینه
+                async def run_bulk_operation_background():
+                    try:
+                        session_paths = [acc.session_path for acc in selected_accounts]
+                        total = len(selected_accounts)
+                        
+                        # تابع بروزرسانی پیشرفت
+                        async def update_progress(current, total, message):
+                            try:
+                                await progress_msg.edit(
+                                    f"⏳ **در حال اجرا...**\n\n"
+                                    f"📊 پیشرفت: {current}/{total}\n"
+                                    f"💬 {message}"
+                                )
+                            except:
+                                pass
+                        
+                        results = None
+                        results_text = ""
+                        op_log_name = ""
+                        op_log_detail = ""
+                        btn_retry = ""
+                        
+                        if op_type == 'join_channel':
+                            results = await self.channel_manager.bulk_join(
+                                session_paths, state['channel_link'],
+                                progress_callback=update_progress, workers=workers, custom_delay=custom_delay
+                            )
+                            results_text = "📊 **نتایج جوین:**\n\n"
+                            btn_retry = "join_channel"
+                            op_log_name = "bulk_join"
+                            op_log_detail = f"{state['channel_link']} - {results['success']}/{total}"
+                            
+                        elif op_type == 'leave_channel':
+                            results = await self.channel_manager.bulk_leave(
+                                session_paths, state['channel_link'],
+                                progress_callback=update_progress, workers=workers, custom_delay=custom_delay
+                            )
+                            results_text = "📊 **نتایج لفت:**\n\n"
+                            btn_retry = "leave_channel"
+                            op_log_name = "bulk_leave"
+                            op_log_detail = f"{state['channel_link']} - {results['success']}/{total}"
+                            
+                        elif op_type == 'start_referral':
+                            results = await self.referral_manager.bulk_start_bot(
+                                session_paths, state['bot_username'], state['start_param'],
+                                progress_callback=update_progress, workers=workers, custom_delay=custom_delay
+                            )
+                            results_text = "📊 **نتایج استارت رفرال:**\n\n"
+                            btn_retry = "start_referral"
+                            op_log_name = "bulk_referral"
+                            op_log_detail = f"@{state['bot_username']} - {results['success']}/{total}"
+                            
+                        elif op_type == 'react':
+                            results = await self.reaction_manager.bulk_react_and_view(
+                                session_paths, state['channel_link'], state['message_id'], reaction_count=1,
+                                progress_callback=update_progress, workers=workers, custom_delay=custom_delay
+                            )
+                            results_text = "📊 **نتایج ری‌آکشن:**\n\n"
+                            btn_retry = "react_post"
+                            op_log_name = "bulk_reaction"
+                            op_log_detail = f"{state['channel_link']}/{state['message_id']} - {results['success']}/{total}"
+                            
+                        elif op_type == 'view_only':
+                            results = await self.reaction_manager.bulk_view_only(
+                                session_paths, state['channel_link'], state['message_id'],
+                                progress_callback=update_progress, workers=workers, custom_delay=custom_delay
+                            )
+                            results_text = "📊 **نتایج سین پیام:**\n\n"
+                            btn_retry = "do_view_only"
+                            op_log_name = "bulk_view"
+                            op_log_detail = f"{state['channel_link']}/{state['message_id']} - {results['success']}/{total}"
+                            
+                        if results:
+                            # نمایش جزئیات نتایج
+                            for i, detail in enumerate(results['details'][:10], 1):
+                                phone_short = selected_accounts[i-1].phone[-4:] if selected_accounts[i-1].phone else "****"
+                                result = detail['result']
+                                if result['success']:
+                                    results_text += f"✅ {phone_short}: موفق\n"
+                                else:
+                                    results_text += f"❌ {phone_short}: {result['message'][:30]}\n"
+                                    
+                            if len(results['details']) > 10:
+                                results_text += f"\n... و {len(results['details']) - 10} مورد دیگر\n"
+                                
+                            results_text += f"\n✅ موفق: {results['success']}\n"
+                            results_text += f"❌ ناموفق: {results['failed']}"
+                            
+                            # بررسی سشن‌های نامعتبر
+                            invalid_count = await self._process_bulk_results_for_invalid_sessions(results, selected_accounts)
+                            if invalid_count > 0:
+                                results_text += f"\n⚠️ سشن نامعتبر: {invalid_count} (غیرفعال شد)"
+                                
+                            await progress_msg.edit(
+                                results_text,
+                                buttons=[
+                                    [Button.inline("🔄 اجرای مجدد", btn_retry)],
+                                    [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
+                                ]
+                            )
+                            
+                            await self.db.log_action(op_log_name, user_id, op_log_detail)
+                            
+                    except Exception as e:
+                        logger.exception(f"خطا در اجرای فرآیند پس‌زمینه: {e}")
+                        try:
+                            await progress_msg.edit(
+                                f"❌ **خطا در اجرا:**\n\n{str(e)[:200]}",
+                                buttons=Button.inline("🔙 منوی اصلی", b"back_to_menu")
+                            )
+                        except:
+                            pass
+                    finally:
+                        if user_id in self.running_operations:
+                            del self.running_operations[user_id]
+
                 # تابع async برای اجرای در پس‌زمینه
                 async def run_scenario_background():
                     used_sessions = set()
                     extracted_codes = {}
                     successful_sessions = []
-                    extracted_codes = {}
                     
                     try:
                         # اجرای سناریو با قفل per-session و worker pool
@@ -4628,8 +4817,11 @@ class BotHandler:
                         for session_path in used_sessions:
                             self.session_locks.discard(session_path)
                 
-                # اجرای تسک در پس‌زمینه
-                asyncio.create_task(run_scenario_background())
+                # اجرای تسک در پس‌زمینه بر اساس نوع عملیات
+                if op_type == 'scenario':
+                    asyncio.create_task(run_scenario_background())
+                else:
+                    asyncio.create_task(run_bulk_operation_background())
                 
                 # پاک کردن state کاربر تا بتونه کار دیگه شروع کنه
                 del self.user_states[user_id]
