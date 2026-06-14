@@ -939,19 +939,29 @@ class BotHandler:
             
             await event.answer()
             
-            buttons = [
-                [Button.inline("📊 آمار کلی", b"admin_stats")],
-                [Button.inline("👥 لیست کاربران", b"admin_users")],
-                [Button.inline("📱 همه اکانت‌ها", b"admin_accounts")],
-                [Button.inline("⏳ کاربران در انتظار", b"admin_pending")],
-                [Button.inline("👑 مدیریت ادمین‌ها", b"admin_manage")],
-                [Button.inline("🔐 تغییر پسورد خودکار", b"admin_auto_password")],
-                [Button.inline("📲 دریافت کد از سشن", b"admin_get_code")],
-                [Button.inline("💾 بکاپ کامل", b"admin_backup")],
-                [Button.inline("📥 ریستور بکاپ", b"admin_restore")],
-                [Button.inline("⚙️ تنظیم کانال بکاپ", b"admin_set_backup_channel")],
-                [Button.inline("🔙 بازگشت", b"back_to_menu")]
-            ]
+            user_id = event.sender_id
+            is_creator = user_id in Config.ADMIN_IDS
+            
+            if is_creator:
+                buttons = [
+                    [Button.inline("📊 آمار کلی", b"admin_stats")],
+                    [Button.inline("👥 لیست کاربران", b"admin_users")],
+                    [Button.inline("📱 همه اکانت‌ها", b"admin_accounts")],
+                    [Button.inline("⏳ کاربران در انتظار", b"admin_pending")],
+                    [Button.inline("👑 مدیریت ادمین‌ها", b"admin_manage")],
+                    [Button.inline("🔐 تغییر پسورد خودکار", b"admin_auto_password")],
+                    [Button.inline("📲 دریافت کد از سشن", b"admin_get_code")],
+                    [Button.inline("💾 بکاپ کامل", b"admin_backup")],
+                    [Button.inline("📥 ریستور بکاپ", b"admin_restore")],
+                    [Button.inline("⚙️ تنظیم کانال بکاپ", b"admin_set_backup_channel")],
+                    [Button.inline("🔙 بازگشت", b"back_to_menu")]
+                ]
+            else:
+                buttons = [
+                    [Button.inline("🔐 تغییر پسورد خودکار", b"admin_auto_password")],
+                    [Button.inline("📲 دریافت کد از سشن", b"admin_get_code")],
+                    [Button.inline("🔙 بازگشت", b"back_to_menu")]
+                ]
             
             await event.edit(
                 "👑 **پنل مدیریت**\n\n"
@@ -963,7 +973,7 @@ class BotHandler:
         async def admin_stats_callback(event):
             """نمایش آمار"""
             # فقط سازنده دسترسی داره
-            if not await self._check_admin_access(event):
+            if not await self._check_creator_access(event):
                 return
             
             await event.answer()
@@ -988,7 +998,7 @@ class BotHandler:
         async def admin_accounts_callback(event):
             """نمایش همه اکانت‌ها"""
             # فقط سازنده دسترسی داره
-            if not await self._check_admin_access(event):
+            if not await self._check_creator_access(event):
                 return
             
             await event.answer()
@@ -1202,7 +1212,7 @@ class BotHandler:
         async def admin_pending_callback(event):
             """نمایش کاربران در انتظار تایید"""
             # فقط سازنده دسترسی داره
-            if not await self._check_admin_access(event):
+            if not await self._check_creator_access(event):
                 return
             
             await event.answer()
@@ -1305,11 +1315,7 @@ class BotHandler:
         async def approve_command_handler(event):
             """تایید دسترسی کاربر با دستور"""
             # فقط سازنده می‌تونه تایید کنه
-            is_creator = event.sender_id in Config.ADMIN_IDS
-            is_admin = await self.db.is_admin(event.sender_id)
-            if not is_creator and not is_admin:
-                await event.respond("⛔️ فقط ادمین‌ها و سازنده می‌توانند کاربر تایید کنند!")
-                return
+            if event.sender_id not in Config.ADMIN_IDS:
                 await event.respond("⛔️ فقط سازنده می‌تواند کاربر تایید کند!")
                 return
             
@@ -1360,11 +1366,7 @@ class BotHandler:
         async def reject_command_handler(event):
             """رد دسترسی کاربر با دستور"""
             # فقط سازنده می‌تونه رد کنه
-            is_creator = event.sender_id in Config.ADMIN_IDS
-            is_admin = await self.db.is_admin(event.sender_id)
-            if not is_creator and not is_admin:
-                await event.respond("⛔️ فقط ادمین‌ها و سازنده می‌توانند درخواست کاربر را رد کنند!")
-                return
+            if event.sender_id not in Config.ADMIN_IDS:
                 await event.respond("⛔️ فقط سازنده می‌تواند کاربر رد کند!")
                 return
             
