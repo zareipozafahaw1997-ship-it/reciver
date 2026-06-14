@@ -224,7 +224,7 @@ class ReactionManager:
                 await client.disconnect()
     
     async def bulk_view_only(self, session_paths: List[str], channel_link: str,
-                            message_id: int, progress_callback=None) -> Dict[str, any]:
+                            message_id: int, progress_callback=None, workers: int = 1, custom_delay: int = None) -> Dict[str, any]:
         """
         سین دسته‌جمعی (بدون ری‌اکشن)
         
@@ -233,6 +233,8 @@ class ReactionManager:
             channel_link: لینک یا یوزرنیم کانال
             message_id: آیدی پیام
             progress_callback: تابع callback برای نمایش پیشرفت
+            workers: تعداد اکانت‌های همزمان
+            custom_delay: تاخیر سفارشی (None = استفاده از تاخیر پیش‌فرض)
             
         Returns:
             دیکشنری حاوی نتایج
@@ -245,35 +247,50 @@ class ReactionManager:
         
         total = len(session_paths)
         
-        for index, session_path in enumerate(session_paths, 1):
-            # محاسبه تاخیر تصادفی
-            delay = Config.DELAY_BETWEEN_ACTIONS + random.randint(0, Config.DELAY_RANDOM_RANGE)
+        # اجرای همزمان با worker
+        for i in range(0, total, workers):
+            batch = session_paths[i:i + workers]
+            tasks = []
             
-            # اگر callback داریم، پیشرفت رو نمایش بدیم
-            if progress_callback:
-                await progress_callback(index, total, f"در حال سین زدن {index}/{total}...")
+            for session_path in batch:
+                tasks.append(self.view_post_only(
+                    session_path, 
+                    channel_link, 
+                    message_id
+                ))
             
-            logger.info(f"سین برای اکانت {index}/{total} - تاخیر: {delay}s")
+            # اجرای همزمان batch
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            result = await self.view_post_only(
-                session_path, 
-                channel_link, 
-                message_id
-            )
+            # پردازش نتایج
+            for j, result in enumerate(batch_results):
+                index = i + j + 1
+                
+                if isinstance(result, Exception):
+                    result = {'success': False, 'message': str(result)}
+                
+                if result['success']:
+                    results['success'] += 1
+                else:
+                    results['failed'] += 1
+                
+                results['details'].append({
+                    'session': Path(batch[j]).name,
+                    'result': result
+                })
+                
+                # بروزرسانی پیشرفت
+                if progress_callback:
+                    await progress_callback(index, total, f"در حال سین زدن {index}/{total}...")
             
-            if result['success']:
-                results['success'] += 1
-            else:
-                results['failed'] += 1
-            
-            results['details'].append({
-                'session': Path(session_path).name,
-                'result': result
-            })
-            
-            # تاخیر بین عملیات‌ها
-            if index < total:
-                logger.info(f"صبر {delay} ثانیه قبل از عملیات بعدی...")
+            # تاخیر بین batch‌ها (به جز آخرین batch)
+            if i + workers < total:
+                if custom_delay is not None:
+                    delay = custom_delay
+                else:
+                    delay = Config.DELAY_BETWEEN_ACTIONS + random.randint(0, Config.DELAY_RANDOM_RANGE)
+                
+                logger.info(f"صبر {delay} ثانیه قبل از batch بعدی...")
                 await asyncio.sleep(delay)
         
         return results
