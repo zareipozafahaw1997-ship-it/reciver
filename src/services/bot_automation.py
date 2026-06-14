@@ -78,9 +78,48 @@ class BotAutomation:
             text = text.replace(f'{{random_num:{match}}}', random_num, 1)
         
         return text
+
+    @staticmethod
+    def resolve_parent_ref(scenario_text: str, idx: int, selected_accounts: list, extracted_codes: dict) -> Optional[str]:
+        """
+        محاسبه رفرال والد بر اساس موقعیت در زنجیره یا درخت
+        """
+        pattern = r'\{(parent_ref(?:_id)?)(?::(chain|tree):(\d+))?(?:\|([a-zA-Z0-9_-]+))?\}'
+        match = re.search(pattern, scenario_text)
+        if not match:
+            return None
+        
+        ref_type = match.group(2) or 'chain'
+        ref_val = int(match.group(3)) if match.group(3) else 3
+        root_ref = match.group(4) or ''
+        
+        active_sessions = [acc.session_path for acc in selected_accounts]
+        
+        if idx == 0:
+            return root_ref
+        
+        if ref_type == 'chain':
+            K = ref_val
+            pos = idx % K
+            if pos == 0:
+                return root_ref
+            else:
+                parent_session = active_sessions[idx - 1]
+                return extracted_codes.get(parent_session, root_ref)
+                
+        elif ref_type == 'tree':
+            M = ref_val
+            parent_idx = (idx - 1) // M
+            if parent_idx < len(active_sessions):
+                parent_session = active_sessions[parent_idx]
+                return extracted_codes.get(parent_session, root_ref)
+            else:
+                return root_ref
+                
+        return root_ref
     
     async def execute_scenario(self, session_path: str, bot_username: str, 
-                               scenario: List[Dict], db=None) -> Dict[str, any]:
+                               scenario: List[Dict], db=None, parent_ref: Optional[str] = None) -> Dict[str, any]:
         """
         اجرای سناریو کامل
         
@@ -139,6 +178,9 @@ class BotAutomation:
             smart_delay_timeout = 20    # timeout پیش‌فرض برای smart_delay
             
             # اجرای هر مرحله
+            extracted_ref_code = None
+            
+            # اجرای هر مرحله
             for step_num, step in enumerate(scenario, 1):
                 action = step.get('action')
                 value = step.get('value', '')
@@ -146,6 +188,8 @@ class BotAutomation:
                 
                 # جایگزینی متغیرهای دینامیک
                 value = self._replace_variables(value)
+                if parent_ref:
+                    value = value.replace('{parent_ref}', parent_ref).replace('{parent_ref_id}', parent_ref)
                 
                 logger.info(f"مرحله {step_num}: {action} - {value}")
                 
@@ -912,6 +956,36 @@ class BotAutomation:
                         except Exception as e:
                             executed_steps.append(f"❌ خطا در فوروارد: {str(e)[:30]}")
                     
+                    
+                    elif action == 'extract_referral':
+                        # استخراج لینک رفرال اختصاصی
+                        try:
+                            # صبر کوتاه برای دریافت پاسخ احتمالی ربات
+                            await asyncio.sleep(2)
+                            
+                            # دریافت آخرین پیام‌های ربات
+                            messages = await client.get_messages(bot, limit=5)
+                            ref_code = None
+                            
+                            for msg in messages:
+                                if msg.text:
+                                    # جستجوی الگوی لینک دعوت/رفرال تلگرام
+                                    match = re.search(r'(?:t\.me|telegram\.me)/[a-zA-Z0-9_]+\?start=([a-zA-Z0-9_-]+)', msg.text)
+                                    if match:
+                                        ref_code = match.group(1)
+                                        break
+                            
+                            if ref_code:
+                                extracted_ref_code = ref_code
+                                executed_steps.append(f"✅ کد رفرال اختصاصی استخراج شد: {ref_code}")
+                                logger.info(f"کد رفرال استخراج شد: {ref_code}")
+                            else:
+                                executed_steps.append("⚠️ رفرال: لینک دعوتی در ۵ پیام اخیر ربات یافت نشد")
+                                logger.warning("لینک رفرال در پیام‌ها پیدا نشد")
+                                
+                        except Exception as e:
+                            logger.error(f"خطا در استخراج رفرال: {e}")
+                            executed_steps.append(f"❌ خطا در استخراج رفرال: {str(e)[:30]}")
                     # تاخیر بین مراحل
                     if smart_delay_enabled and action not in ('wait', 'wait_for', 'stop', 'smart_delay'):
                         # صبر هوشمند: منتظر پیام جدید از ربات
@@ -995,7 +1069,8 @@ class BotAutomation:
                 'success': True,
                 'message': 'سناریو با موفقیت اجرا شد',
                 'bot_username': bot_username,
-                'executed_steps': executed_steps
+                'executed_steps': executed_steps,
+                'extracted_ref_code': extracted_ref_code
             }
             
         except Exception as e:
@@ -1123,6 +1198,11 @@ class BotAutomation:
         no_colon_actions = {
             'auto_join', 'auto_join_leave', 'ajl',
             'share_phone', 'share_contact',
+            'smart_delay', 'extract_referral'
+        }
+        no_colon_actions = {
+            'auto_join', 'auto_join_leave', 'ajl',
+            'share_phone', 'share_contact',
             'smart_delay'
         }
         
@@ -1245,7 +1325,7 @@ class BotAutomation:
                     no_colon_actions = {
                         'auto_join', 'auto_join_leave', 'ajl',
                         'share_phone', 'share_contact',
-                        'smart_delay'
+                        'smart_delay', 'extract_referral'
                     }
                     action = line.strip().lower()
                     if action in no_colon_actions:
