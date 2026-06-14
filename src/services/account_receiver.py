@@ -324,3 +324,98 @@ class AccountReceiver:
         except Exception as e:
             logger.exception(f"خطا در بارگذاری سشن: {e}")
             raise
+    
+    async def change_account_password(self, session_path: str, new_password: str, current_password: str = None) -> Dict[str, any]:
+        """
+        تغییر پسورد اکانت تلگرام (Two-Step Verification)
+        
+        Args:
+            session_path: مسیر فایل سشن
+            new_password: پسورد جدید
+            current_password: پسورد فعلی (اگر اکانت قبلاً پسورد داشته باشد)
+            
+        Returns:
+            دیکشنری حاوی وضعیت و پیام
+        """
+        client = None
+        try:
+            client = await self.load_session(session_path)
+            
+            try:
+                from telethon.tl.functions.account import GetPasswordRequest
+                password_state = await client(GetPasswordRequest())
+                
+                if password_state.has_password:
+                    # اکانت پسورد داره - باید پسورد فعلی رو بدیم
+                    if not current_password:
+                        # پسورد فعلی نداریم، نمی‌تونیم تغییر بدیم
+                        await client.disconnect()
+                        return {
+                            'success': False,
+                            'message': 'این اکانت پسورد دارد اما پسورد فعلی در دسترس نیست',
+                            'has_password': True
+                        }
+                    
+                    logger.info("اکانت پسورد دارد، در حال تغییر با پسورد فعلی...")
+                    result = await client.edit_2fa(
+                        current_password=current_password,
+                        new_password=new_password,
+                        hint=''
+                    )
+                else:
+                    # اکانت پسورد نداره - current_password نباید ست بشه
+                    logger.info("اکانت پسورد ندارد، در حال ست کردن پسورد جدید...")
+                    result = await client.edit_2fa(
+                        current_password=None,
+                        new_password=new_password,
+                        hint=''
+                    )
+                
+                await client.disconnect()
+                
+                if result:
+                    logger.info(f"پسورد اکانت با موفقیت تغییر کرد: {session_path}")
+                    return {
+                        'success': True,
+                        'message': 'پسورد با موفقیت تغییر کرد',
+                        'password': new_password
+                    }
+                else:
+                    return {
+                        'success': False,
+                        'message': 'تغییر پسورد ناموفق بود'
+                    }
+                
+            except errors.EmailUnconfirmedError:
+                await client.disconnect()
+                return {
+                    'success': False,
+                    'message': 'این اکانت نیاز به تایید ایمیل دارد'
+                }
+            
+            except errors.PasswordHashInvalidError:
+                await client.disconnect()
+                return {
+                    'success': False,
+                    'message': 'پسورد فعلی نادرست است'
+                }
+            
+            except Exception as e:
+                await client.disconnect()
+                logger.exception(f"خطا در تغییر پسورد: {e}")
+                return {
+                    'success': False,
+                    'message': f'خطا: {str(e)}'
+                }
+            
+        except Exception as e:
+            if client:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+            logger.exception(f"خطا در تغییر پسورد: {e}")
+            return {
+                'success': False,
+                'message': f'خطا: {str(e)}'
+            }

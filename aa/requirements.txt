@@ -1,0 +1,9 @@
+telethon==1.36.0
+python-dotenv==1.0.1
+motor==3.6.0
+pymongo==4.9.2
+redis==5.2.1
+python-dateutil==2.9.0
+aiohttp==3.9.5
+PySocks==1.7.1
+loguru==0.7.2

@@ -80,7 +80,7 @@ class BotAutomation:
         return text
     
     async def execute_scenario(self, session_path: str, bot_username: str, 
-                               scenario: List[Dict]) -> Dict[str, any]:
+                               scenario: List[Dict], db=None) -> Dict[str, any]:
         """
         اجرای سناریو کامل
         
@@ -88,6 +88,7 @@ class BotAutomation:
             session_path: مسیر فایل سشن
             bot_username: یوزرنیم ربات
             scenario: لیست مراحل سناریو
+            db: دیتابیس برای غیرفعال کردن سشن نامعتبر (اختیاری)
             
         Returns:
             دیکشنری حاوی وضعیت و پیام
@@ -107,9 +108,14 @@ class BotAutomation:
             await client.connect()
             
             if not await client.is_user_authorized():
+                # سشن نامعتبر — غیرفعال کن و فایل رو منتقل کن
+                logger.warning(f"سشن نامعتبر: {session_path}")
+                if db:
+                    await db.invalidate_session(session_path)
                 return {
                     'success': False,
-                    'message': 'سشن نامعتبر است'
+                    'message': 'سشن نامعتبر است',
+                    'invalid_session': True
                 }
             
             # حذف @ از یوزرنیم
@@ -128,6 +134,9 @@ class BotAutomation:
             logger.info(f"شروع اجرای سناریو برای @{bot_username}")
             
             executed_steps = []
+            auto_leave_channels = []  # کانال‌هایی که باید در پایان لفت داده شوند
+            smart_delay_enabled = False  # حالت صبر هوشمند
+            smart_delay_timeout = 20    # timeout پیش‌فرض برای smart_delay
             
             # اجرای هر مرحله
             for step_num, step in enumerate(scenario, 1):
@@ -213,17 +222,30 @@ class BotAutomation:
                         # جوین کانال/گروه
                         channel_link = value.strip()
                         try:
-                            # تجزیه لینک
                             if 'joinchat/' in channel_link or '/+' in channel_link:
-                                # لینک خصوصی
                                 hash_part = channel_link.split('/')[-1].replace('+', '')
                                 await client(functions.messages.ImportChatInviteRequest(hash_part))
                             else:
-                                # لینک عمومی یا یوزرنیم
                                 username = channel_link.split('/')[-1].lstrip('@')
                                 await client(functions.channels.JoinChannelRequest(username))
-                            
                             executed_steps.append(f"✅ جوین: {channel_link[:30]}")
+                        except Exception as e:
+                            executed_steps.append(f"❌ جوین ناموفق: {str(e)[:30]}")
+
+                    elif action in ('join_leave', 'jl'):
+                        # جوین + ثبت برای لفت خودکار در پایان سناریو
+                        # فرمت: join_leave: https://t.me/channel
+                        channel_link = value.strip()
+                        try:
+                            if 'joinchat/' in channel_link or '/+' in channel_link:
+                                hash_part = channel_link.split('/')[-1].replace('+', '')
+                                await client(functions.messages.ImportChatInviteRequest(hash_part))
+                            else:
+                                username = channel_link.split('/')[-1].lstrip('@')
+                                await client(functions.channels.JoinChannelRequest(username))
+                            # ثبت برای لفت خودکار در پایان
+                            auto_leave_channels.append(channel_link)
+                            executed_steps.append(f"✅ جوین (لفت خودکار در پایان): {channel_link[:30]}")
                         except Exception as e:
                             executed_steps.append(f"❌ جوین ناموفق: {str(e)[:30]}")
                     
@@ -240,11 +262,366 @@ class BotAutomation:
                         except Exception as e:
                             executed_steps.append(f"❌ لفت ناموفق: {str(e)[:30]}")
                     
+                    elif action in ('auto_join', 'auto_join_leave', 'ajl'):
+                        # جوین خودکار به تمام کانال‌های موجود در پیام ربات
+                        # auto_join        ← جوین + کلیک آخرین دکمه
+                        # auto_join_leave / ajl ← مثل auto_join ولی در پایان سناریو لفت می‌ده
+                        # فرمت‌ها:
+                        #   auto_join                  ← جوین همه + کلیک آخرین دکمه
+                        #   auto_join: no_click        ← فقط جوین، بدون کلیک
+                        #   auto_join: click=عضو شدم  ← جوین + کلیک دکمه خاص
+                        is_auto_leave = action in ('auto_join_leave', 'ajl')
+                        
+                        try:
+                            # تجزیه value
+                            mode = 'last_button'  # پیش‌فرض
+                            click_text = None
+                            
+                            if value:
+                                v = value.strip().lower()
+                                if v == 'no_click':
+                                    mode = 'no_click'
+                                elif v.startswith('click='):
+                                    mode = 'custom_click'
+                                    click_text = value.strip()[6:]
+                                else:
+                                    mode = 'last_button'
+                            
+                            # صبر کوتاه برای دریافت پیام ربات
+                            await asyncio.sleep(1.5)
+                            
+                            # دریافت آخرین پیام ربات
+                            messages = await client.get_messages(bot, limit=3)
+                            
+                            if not messages:
+                                executed_steps.append(f"⚠️ {action}: پیامی از ربات دریافت نشد")
+                                continue
+                            
+                            # استخراج لینک‌های t.me فقط از دکمه‌های شیشه‌ای (inline URL buttons)
+                            found_links = []
+                            all_buttons = []
+                            
+                            def normalize_tme_link(url: str) -> str:
+                                """
+                                normalize کردن لینک‌های تلگرام به فرمت استاندارد
+                                حالت‌های ممکن:
+                                  t.me/channel          → https://t.me/channel
+                                  t.me/+HASH            → https://t.me/+HASH
+                                  t.me/joinchat/HASH    → https://t.me/joinchat/HASH
+                                  https://t.me/channel  → https://t.me/channel  (بدون تغییر)
+                                  @channel              → https://t.me/channel
+                                """
+                                url = url.strip()
+                                if not url:
+                                    return ''
+                                # حالت @username
+                                if url.startswith('@'):
+                                    return f"https://t.me/{url[1:]}"
+                                # حالت بدون پروتکل
+                                if url.startswith('t.me/'):
+                                    return f"https://{url}"
+                                # حالت //t.me/
+                                if url.startswith('//t.me/'):
+                                    return f"https:{url}"
+                                # حالت http:// → تبدیل به https://
+                                if url.startswith('http://t.me/'):
+                                    return url.replace('http://', 'https://', 1)
+                                # حالت کامل https://
+                                return url
+                            
+                            for msg in messages:
+                                if msg.buttons:
+                                    for row in msg.buttons:
+                                        for btn in row:
+                                            all_buttons.append(btn)
+                                            # فقط دکمه‌هایی که URL دارن و t.me هستن
+                                            if hasattr(btn, 'url') and btn.url:
+                                                raw = btn.url.strip()
+                                                if 't.me/' in raw or raw.startswith('@'):
+                                                    normalized = normalize_tme_link(raw)
+                                                    if normalized and normalized not in found_links:
+                                                        found_links.append(normalized)
+                            
+                            if not found_links:
+                                executed_steps.append(f"⚠️ {action}: هیچ لینک کانالی پیدا نشد")
+                            else:
+                                label = "auto_join_leave" if is_auto_leave else "auto_join"
+                                executed_steps.append(f"🔍 {label}: {len(found_links)} لینک پیدا شد")
+                                
+                                # جوین به هر لینک
+                                joined = 0
+                                for link in found_links:
+                                    try:
+                                        if 'joinchat/' in link or '/+' in link:
+                                            # لینک خصوصی — استخراج hash کامل
+                                            if '/+' in link:
+                                                hash_part = link.split('/+')[-1].strip().rstrip('/')
+                                            elif 'joinchat/' in link:
+                                                hash_part = link.split('joinchat/')[-1].strip().rstrip('/')
+                                            else:
+                                                hash_part = link.split('/')[-1].replace('+', '').strip()
+                                            
+                                            if not hash_part:
+                                                executed_steps.append(f"⚠️ hash خالی: {link[:30]}")
+                                                continue
+                                            
+                                            await client(functions.messages.ImportChatInviteRequest(hash_part))
+                                        else:
+                                            username = link.rstrip('/').split('/')[-1].lstrip('@')
+                                            if not username:
+                                                continue
+                                            
+                                            # بررسی اینکه entity کانال/گروه هست نه یوزر
+                                            from telethon.tl.types import User, Channel, Chat
+                                            try:
+                                                entity = await client.get_entity(username)
+                                            except Exception:
+                                                executed_steps.append(f"⚠️ entity پیدا نشد: {username}")
+                                                continue
+                                            
+                                            if isinstance(entity, User):
+                                                executed_steps.append(f"⏭️ skip (یوزر): {username}")
+                                                continue
+                                            
+                                            await client(functions.channels.JoinChannelRequest(entity))
+                                        
+                                        joined += 1
+                                        executed_steps.append(f"✅ جوین: {link.split('/')[-1]}")
+                                        if is_auto_leave and link not in auto_leave_channels:
+                                            auto_leave_channels.append(link)
+                                        await asyncio.sleep(1.5)
+                                    except Exception as e:
+                                        err = str(e)
+                                        if 'already' in err.lower() or 'USER_ALREADY' in err:
+                                            executed_steps.append(f"ℹ️ قبلاً عضو: {link.split('/')[-1]}")
+                                            joined += 1
+                                            if is_auto_leave and link not in auto_leave_channels:
+                                                auto_leave_channels.append(link)
+                                        elif 'expired' in err.lower() or 'INVITE_HASH_EXPIRED' in err:
+                                            executed_steps.append(f"⚠️ لینک منقضی: {link.split('/')[-1][:20]}")
+                                        elif 'wait' in err.lower() or 'FLOOD' in err:
+                                            # flood wait - صبر کن
+                                            import re as _re
+                                            wait_match = _re.search(r'(\d+)', err)
+                                            wait_sec = int(wait_match.group(1)) if wait_match else 10
+                                            executed_steps.append(f"⏳ flood wait {wait_sec}s: {link.split('/')[-1][:20]}")
+                                            await asyncio.sleep(min(wait_sec, 30))
+                                        else:
+                                            executed_steps.append(f"❌ جوین ناموفق {link.split('/')[-1]}: {err[:40]}")
+                                
+                                suffix = " (لفت خودکار در پایان)" if is_auto_leave else ""
+                                executed_steps.append(f"📊 جوین: {joined}/{len(found_links)} موفق{suffix}")
+                            
+                            # کلیک روی دکمه
+                            if mode != 'no_click' and all_buttons:
+                                await asyncio.sleep(1)
+                                
+                                fresh_msg = await client.get_messages(bot, limit=1)
+                                if fresh_msg and fresh_msg[0].buttons:
+                                    flat_buttons = []
+                                    for row in fresh_msg[0].buttons:
+                                        for btn in row:
+                                            flat_buttons.append(btn)
+                                    
+                                    btn_to_click = None
+                                    
+                                    if mode == 'custom_click' and click_text:
+                                        for btn in flat_buttons:
+                                            btn_txt = btn.text if hasattr(btn, 'text') else ''
+                                            clean_btn = ''.join(c for c in btn_txt if c.isalnum() or c.isspace()).strip().lower()
+                                            clean_search = ''.join(c for c in click_text if c.isalnum() or c.isspace()).strip().lower()
+                                            if clean_search in clean_btn:
+                                                btn_to_click = btn
+                                                break
+                                    else:
+                                        btn_to_click = flat_buttons[-1]
+                                    
+                                    if btn_to_click:
+                                        btn_txt = btn_to_click.text if hasattr(btn_to_click, 'text') else '?'
+                                        await btn_to_click.click()
+                                        executed_steps.append(f"✅ کلیک دکمه: {btn_txt}")
+                                    else:
+                                        executed_steps.append(f"⚠️ دکمه '{click_text}' پیدا نشد")
+                        
+                        except Exception as e:
+                            logger.error(f"خطا در {action}: {e}")
+                            executed_steps.append(f"❌ خطا در {action}: {str(e)[:40]}")
+                    
+                    elif action == 'join_addlist':
+                        # جوین به addlist (لیست کانال‌ها/گروه‌ها)
+                        # فرمت: join_addlist: https://t.me/addlist/...
+                        addlist_link = value.strip()
+                        try:
+                            # استخراج slug از لینک
+                            # مثال: https://t.me/addlist/BJ1gpHd43ew2MzQx
+                            if 'addlist/' in addlist_link:
+                                slug = addlist_link.split('addlist/')[-1].strip()
+                                
+                                # استفاده از CheckChatlistInviteRequest برای چک کردن
+                                result = await client(functions.chatlists.CheckChatlistInviteRequest(
+                                    slug=slug
+                                ))
+                                
+                                # جوین به addlist
+                                await client(functions.chatlists.JoinChatlistInviteRequest(
+                                    slug=slug
+                                ))
+                                
+                                executed_steps.append(f"✅ جوین addlist: {addlist_link[:40]}")
+                                logger.info(f"جوین موفق به addlist: {slug}")
+                            else:
+                                executed_steps.append(f"❌ لینک addlist نامعتبر")
+                        except Exception as e:
+                            executed_steps.append(f"❌ جوین addlist ناموفق: {str(e)[:40]}")
+                            logger.error(f"خطا در جوین addlist: {e}")
+                    
+                    elif action == 'leave_addlist':
+                        # خروج از addlist
+                        # فرمت: leave_addlist: https://t.me/addlist/...
+                        addlist_link = value.strip()
+                        try:
+                            # استخراج slug از لینک
+                            if 'addlist/' in addlist_link:
+                                slug = addlist_link.split('addlist/')[-1].strip()
+                                
+                                # دریافت اطلاعات addlist
+                                result = await client(functions.chatlists.CheckChatlistInviteRequest(
+                                    slug=slug
+                                ))
+                                
+                                # اگر chatlist_id داشته باشیم، از اون استفاده می‌کنیم
+                                # در غیر این صورت باید از slug استفاده کنیم
+                                if hasattr(result, 'chatlist') and hasattr(result.chatlist, 'id'):
+                                    chatlist_id = result.chatlist.id
+                                    
+                                    # حذف addlist
+                                    await client(functions.chatlists.DeleteChatlistRequest(
+                                        chatlist_id=chatlist_id
+                                    ))
+                                    
+                                    executed_steps.append(f"✅ خروج از addlist: {addlist_link[:40]}")
+                                    logger.info(f"خروج موفق از addlist: {slug}")
+                                else:
+                                    executed_steps.append(f"⚠️ addlist پیدا نشد یا قبلاً حذف شده")
+                            else:
+                                executed_steps.append(f"❌ لینک addlist نامعتبر")
+                        except Exception as e:
+                            executed_steps.append(f"❌ خروج از addlist ناموفق: {str(e)[:40]}")
+                            logger.error(f"خطا در خروج از addlist: {e}")
+                    
+                    elif action == 'smart_delay':
+                        # فعال/غیرفعال کردن صبر هوشمند بعد از هر دستور
+                        # فرمت‌ها:
+                        #   smart_delay: on        ← فعال با timeout پیش‌فرض 20s
+                        #   smart_delay: on, 30    ← فعال با timeout 30s
+                        #   smart_delay: off       ← غیرفعال
+                        v = value.strip().lower() if value else 'on'
+                        if v.startswith('off'):
+                            smart_delay_enabled = False
+                            executed_steps.append("🔕 صبر هوشمند غیرفعال شد")
+                        else:
+                            smart_delay_enabled = True
+                            parts = [p.strip() for p in v.split(',')]
+                            if len(parts) > 1:
+                                try:
+                                    smart_delay_timeout = int(parts[1])
+                                except ValueError:
+                                    smart_delay_timeout = 20
+                            else:
+                                smart_delay_timeout = 20
+                            executed_steps.append(f"🔔 صبر هوشمند فعال شد (timeout: {smart_delay_timeout}s)")
+                        continue  # تاخیر معمولی نمی‌خواد
+                    
                     elif action == 'wait':
                         # صبر کردن
                         wait_time = int(value) if value else delay
                         await asyncio.sleep(wait_time)
                         executed_steps.append(f"⏱ صبر {wait_time} ثانیه")
+                    
+                    elif action == 'wait_for':
+                        # صبر هوشمند - منتظر پیام جدید از ربات می‌مونه
+                        # فرمت‌ها:
+                        #   wait_for: 30              ← صبر تا هر پیام جدیدی بیاد (max 30s)
+                        #   wait_for: 30, کیف پول     ← صبر تا پیام حاوی "کیف پول" بیاد
+                        #   wait_for: 30, button      ← صبر تا پیامی با دکمه بیاد
+                        try:
+                            timeout = 30  # پیش‌فرض
+                            keyword = None
+                            wait_for_button = False
+                            
+                            if value:
+                                parts = [p.strip() for p in value.split(',', 1)]
+                                try:
+                                    timeout = int(parts[0])
+                                except ValueError:
+                                    timeout = 30
+                                
+                                if len(parts) > 1:
+                                    kw = parts[1].strip()
+                                    if kw.lower() == 'button':
+                                        wait_for_button = True
+                                    else:
+                                        keyword = kw
+                            
+                            # دریافت آخرین پیام فعلی برای مقایسه
+                            current_msgs = await client.get_messages(bot, limit=1)
+                            last_msg_id = current_msgs[0].id if current_msgs else 0
+                            
+                            # توضیح انتظار
+                            if keyword:
+                                wait_desc = f"پیام حاوی '{keyword}'"
+                            elif wait_for_button:
+                                wait_desc = "پیام با دکمه"
+                            else:
+                                wait_desc = "پیام جدید"
+                            
+                            executed_steps.append(f"⏳ منتظر {wait_desc} (حداکثر {timeout}s)...")
+                            
+                            # حلقه انتظار
+                            elapsed = 0
+                            found = False
+                            check_interval = 1  # هر 1 ثانیه چک کن
+                            
+                            while elapsed < timeout:
+                                await asyncio.sleep(check_interval)
+                                elapsed += check_interval
+                                
+                                # دریافت پیام‌های جدید
+                                new_msgs = await client.get_messages(bot, limit=3)
+                                
+                                for msg in new_msgs:
+                                    if msg.id <= last_msg_id:
+                                        continue  # پیام قدیمیه
+                                    
+                                    # پیام جدید پیدا شد
+                                    if keyword:
+                                        # بررسی کلمه کلیدی
+                                        msg_text = msg.text or ''
+                                        if keyword.lower() in msg_text.lower():
+                                            found = True
+                                            executed_steps.append(f"✅ پیام با '{keyword}' دریافت شد ({elapsed}s)")
+                                            break
+                                    elif wait_for_button:
+                                        # بررسی وجود دکمه
+                                        if msg.buttons:
+                                            found = True
+                                            executed_steps.append(f"✅ پیام با دکمه دریافت شد ({elapsed}s)")
+                                            break
+                                    else:
+                                        # هر پیام جدیدی کافیه
+                                        found = True
+                                        executed_steps.append(f"✅ پیام جدید دریافت شد ({elapsed}s)")
+                                        break
+                                
+                                if found:
+                                    break
+                            
+                            if not found:
+                                executed_steps.append(f"⚠️ timeout: {wait_desc} در {timeout}s نرسید، ادامه می‌دهیم...")
+                        
+                        except Exception as e:
+                            logger.error(f"خطا در wait_for: {e}")
+                            executed_steps.append(f"⚠️ خطا در wait_for: {str(e)[:30]}, ادامه...")
                     
                     elif action == 'stop':
                         # توقف موقت سناریو
@@ -435,12 +812,17 @@ class BotAutomation:
                             # دریافت اطلاعات کاربر فعلی
                             me = await client.get_me()
                             
-                            # ارسال شماره تماس
+                            # ارسال شماره تماس با استفاده از InputMediaContact
+                            from telethon.tl.types import InputMediaContact
+                            
                             await client.send_message(
                                 bot,
-                                file=None,
-                                message='',
-                                contact=me.phone
+                                file=InputMediaContact(
+                                    phone_number=me.phone,
+                                    first_name=me.first_name or "User",
+                                    last_name=me.last_name or "",
+                                    vcard=""
+                                )
                             )
                             
                             executed_steps.append(f"✅ شماره تماس به اشتراک گذاشته شد: +{me.phone}")
@@ -531,11 +913,83 @@ class BotAutomation:
                             executed_steps.append(f"❌ خطا در فوروارد: {str(e)[:30]}")
                     
                     # تاخیر بین مراحل
-                    await asyncio.sleep(delay)
+                    if smart_delay_enabled and action not in ('wait', 'wait_for', 'stop', 'smart_delay'):
+                        # صبر هوشمند: منتظر پیام جدید از ربات
+                        try:
+                            current_msgs = await client.get_messages(bot, limit=1)
+                            last_id = current_msgs[0].id if current_msgs else 0
+                            
+                            elapsed = 0
+                            found = False
+                            while elapsed < smart_delay_timeout:
+                                await asyncio.sleep(1)
+                                elapsed += 1
+                                new_msgs = await client.get_messages(bot, limit=1)
+                                if new_msgs and new_msgs[0].id > last_id:
+                                    found = True
+                                    break
+                            
+                            if not found:
+                                # timeout شد، یه تاخیر کوچک بزار و ادامه بده
+                                await asyncio.sleep(delay)
+                        except Exception:
+                            await asyncio.sleep(delay)
+                    else:
+                        await asyncio.sleep(delay)
                     
                 except Exception as e:
                     logger.error(f"خطا در مرحله {step_num}: {e}")
                     executed_steps.append(f"❌ خطا در مرحله {step_num}: {str(e)[:30]}")
+            
+            # ── لفت خودکار کانال‌های join_leave ─────────────────
+            if auto_leave_channels:
+                executed_steps.append("─" * 20)
+                executed_steps.append("🚪 لفت خودکار کانال‌ها:")
+                for channel_link in auto_leave_channels:
+                    try:
+                        if 'joinchat/' in channel_link or '/+' in channel_link:
+                            # لینک خصوصی — جستجو در دیالوگ‌ها با invite hash
+                            hash_part = channel_link.split('/')[-1].replace('+', '')
+                            left = False
+                            
+                            # جستجو در دیالوگ‌ها برای پیدا کردن کانال
+                            async for dialog in client.iter_dialogs(limit=200):
+                                entity = dialog.entity
+                                # بررسی invite_hash اگر موجود باشه
+                                if hasattr(entity, 'username') and entity.username:
+                                    continue  # کانال‌های عمومی رو skip کن
+                                # سعی کن با title یا id پیدا کنیم
+                                try:
+                                    await client(functions.channels.LeaveChannelRequest(entity))
+                                    # اگر موفق شد، این کانال بود
+                                    executed_steps.append(f"✅ لفت: {dialog.name[:30]}")
+                                    left = True
+                                    break
+                                except Exception:
+                                    continue
+                            
+                            if not left:
+                                # روش دوم: از طریق CheckChatInvite
+                                try:
+                                    invite_info = await client(functions.messages.CheckChatInviteRequest(hash=hash_part))
+                                    if hasattr(invite_info, 'chat'):
+                                        await client(functions.channels.LeaveChannelRequest(invite_info.chat))
+                                        executed_steps.append(f"✅ لفت (invite): {channel_link.split('/')[-1][:20]}")
+                                        left = True
+                                except Exception:
+                                    pass
+                            
+                            if not left:
+                                executed_steps.append(f"⚠️ لفت ناموفق (لینک خصوصی): {channel_link[:30]}")
+                        else:
+                            username = channel_link.rstrip('/').split('/')[-1].lstrip('@')
+                            entity = await client.get_entity(username)
+                            await client(functions.channels.LeaveChannelRequest(entity))
+                            executed_steps.append(f"✅ لفت: {channel_link.split('/')[-1]}")
+                        await asyncio.sleep(1)
+                    except Exception as e:
+                        executed_steps.append(f"❌ لفت ناموفق: {str(e)[:40]}")
+                        logger.error(f"خطا در لفت خودکار {channel_link}: {e}")
             
             return {
                 'success': True,
@@ -545,10 +999,25 @@ class BotAutomation:
             }
             
         except Exception as e:
+            err_str = str(e)
             logger.exception(f"خطا در اجرای سناریو: {e}")
+            
+            # تشخیص سشن نامعتبر از خطاهای مختلف
+            invalid_keywords = [
+                'auth_key', 'unauthorized', 'SESSION_REVOKED',
+                'USER_DEACTIVATED', 'AUTH_KEY_UNREGISTERED',
+                'SESSION_EXPIRED', 'سشن نامعتبر'
+            ]
+            is_invalid = any(kw.lower() in err_str.lower() for kw in invalid_keywords)
+            
+            if is_invalid and db:
+                logger.warning(f"سشن نامعتبر تشخیص داده شد، غیرفعال می‌شود: {session_path}")
+                await db.invalidate_session(session_path)
+            
             return {
                 'success': False,
-                'message': f'خطا: {str(e)}'
+                'message': f'خطا: {err_str}',
+                'invalid_session': is_invalid
             }
         
         finally:
@@ -557,7 +1026,8 @@ class BotAutomation:
     
     async def bulk_execute_scenario(self, session_paths: List[str], bot_username: str,
                                     scenario: List[Dict], progress_callback=None, 
-                                    cancel_flag: Optional[Dict] = None) -> Dict[str, any]:
+                                    cancel_flag: Optional[Dict] = None,
+                                    db=None) -> Dict[str, any]:
         """
         اجرای دسته‌جمعی سناریو با قابلیت لغو و مکث
         
@@ -567,6 +1037,7 @@ class BotAutomation:
             scenario: لیست مراحل سناریو
             progress_callback: تابع callback برای نمایش پیشرفت
             cancel_flag: دیکشنری برای بررسی لغو/مکث عملیات
+            db: دیتابیس برای غیرفعال کردن سشن‌های نامعتبر
             
         Returns:
             دیکشنری حاوی نتایج
@@ -575,6 +1046,7 @@ class BotAutomation:
             'success': 0,
             'failed': 0,
             'cancelled': 0,
+            'invalid_sessions': 0,
             'details': []
         }
         
@@ -590,9 +1062,8 @@ class BotAutomation:
             # بررسی مکث - صبر تا resume شود
             while cancel_flag and cancel_flag.get('paused'):
                 logger.info(f"عملیات در حالت مکث است، صبر می‌کنیم...")
-                await asyncio.sleep(1)  # هر 1 ثانیه چک می‌کنیم
+                await asyncio.sleep(1)
                 
-                # اگر در حین مکث لغو شد
                 if cancel_flag.get('cancelled'):
                     logger.info(f"عملیات در حین مکث لغو شد")
                     results['cancelled'] = total - index + 1
@@ -601,16 +1072,18 @@ class BotAutomation:
             # محاسبه تاخیر تصادفی
             delay = Config.DELAY_BETWEEN_ACTIONS + random.randint(0, Config.DELAY_RANDOM_RANGE)
             
-            # اگر callback داریم، پیشرفت رو نمایش بدیم
             if progress_callback:
                 await progress_callback(index, total, f"در حال اجرای سناریو {index}/{total}...")
             
             logger.info(f"اجرای سناریو برای اکانت {index}/{total} - تاخیر: {delay}s")
             
-            result = await self.execute_scenario(session_path, bot_username, scenario)
+            result = await self.execute_scenario(session_path, bot_username, scenario, db=db)
             
             if result['success']:
                 results['success'] += 1
+            elif result.get('invalid_session'):
+                results['invalid_sessions'] += 1
+                results['failed'] += 1
             else:
                 results['failed'] += 1
             
@@ -646,6 +1119,13 @@ class BotAutomation:
         scenario = []
         lines = scenario_text.strip().split('\n')
         
+        # دستوراتی که می‌توانند بدون : نوشته شوند
+        no_colon_actions = {
+            'auto_join', 'auto_join_leave', 'ajl',
+            'share_phone', 'share_contact',
+            'smart_delay'
+        }
+        
         for line in lines:
             line = line.strip()
             if not line or line.startswith('#'):
@@ -661,6 +1141,15 @@ class BotAutomation:
                     'value': value,
                     'delay': 2
                 })
+            else:
+                # دستوراتی که بدون : نوشته شدن
+                action = line.strip().lower()
+                if action in no_colon_actions:
+                    scenario.append({
+                        'action': action,
+                        'value': '',
+                        'delay': 2
+                    })
         
         return scenario
     
@@ -721,37 +1210,50 @@ class BotAutomation:
                 referral_codes = []
             
             # دستورات سناریو
-            elif ':' in line and current_bot:
-                action, value = line.split(':', 1)
-                action = action.strip().lower()
-                value = value.strip()
+            elif current_bot:
+                if ':' in line:
+                    action, value = line.split(':', 1)
+                    action = action.strip().lower()
+                    value = value.strip()
+                    
+                    # بررسی اینکه آیا start با تقسیم‌بندی رفرال است
+                    if action == 'start' and '|' in value:
+                        # فرمت: ref_code | count
+                        parts = value.split('|')
+                        ref_code = parts[0].strip()
+                        try:
+                            target_count = int(parts[1].strip())
+                            referral_codes.append({
+                                'code': ref_code,
+                                'target_count': target_count,
+                                'success_count': 0,
+                                'failed_count': 0,
+                                'accounts_used': []
+                            })
+                            continue
+                        except ValueError:
+                            pass
+                    
+                    current_scenario.append({
+                        'action': action,
+                        'value': value,
+                        'delay': 2
+                    })
                 
-                # بررسی اینکه آیا start با تقسیم‌بندی رفرال است
-                if action == 'start' and '|' in value:
-                    # فرمت: ref_code | count
-                    parts = value.split('|')
-                    ref_code = parts[0].strip()
-                    try:
-                        target_count = int(parts[1].strip())
-                        referral_codes.append({
-                            'code': ref_code,
-                            'target_count': target_count,
-                            'success_count': 0,
-                            'failed_count': 0,
-                            'accounts_used': []
+                else:
+                    # دستوراتی که بدون : نوشته شدن
+                    no_colon_actions = {
+                        'auto_join', 'auto_join_leave', 'ajl',
+                        'share_phone', 'share_contact',
+                        'smart_delay'
+                    }
+                    action = line.strip().lower()
+                    if action in no_colon_actions:
+                        current_scenario.append({
+                            'action': action,
+                            'value': '',
+                            'delay': 2
                         })
-                        # اگر رفرال چندگانه است، start رو به سناریو اضافه نمی‌کنیم
-                        # چون بعداً دینامیک اضافه می‌شه
-                        continue
-                    except ValueError:
-                        # اگر فرمت اشتباه بود، به صورت عادی اضافه کن
-                        pass
-                
-                current_scenario.append({
-                    'action': action,
-                    'value': value,
-                    'delay': 2
-                })
         
         # ذخیره آخرین ربات
         if current_bot and current_scenario:
@@ -765,7 +1267,8 @@ class BotAutomation:
     
     async def execute_multi_bot_scenario(self, session_path: str, 
                                          bots_scenarios: List[Dict],
-                                         referral_stats: Optional[Dict] = None) -> Dict[str, any]:
+                                         referral_stats: Optional[Dict] = None,
+                                         db=None) -> Dict[str, any]:
         """
         اجرای سناریو چند ربات
         
@@ -813,7 +1316,17 @@ class BotAutomation:
             
             logger.info(f"اجرای سناریو برای ربات @{bot_username}")
             
-            result = await self.execute_scenario(session_path, bot_username, scenario)
+            result = await self.execute_scenario(session_path, bot_username, scenario, db=db)
+            
+            # اگر سشن نامعتبر بود، بقیه ربات‌ها رو هم skip کن
+            if result.get('invalid_session'):
+                logger.warning(f"سشن نامعتبر در execute_multi_bot_scenario: {session_path}")
+                return {
+                    'success': False,
+                    'message': 'سشن نامعتبر است',
+                    'invalid_session': True,
+                    'results': all_results
+                }
             
             # اگر رفرال چندگانه داریم، آمار رو آپدیت کن
             if referral_codes and referral_stats and current_ref:
@@ -953,7 +1466,8 @@ class BotAutomation:
     async def bulk_execute_multi_bot_scenario(self, session_paths: List[str],
                                               bots_scenarios: List[Dict],
                                               progress_callback=None,
-                                              cancel_flag: Optional[Dict] = None) -> Dict[str, any]:
+                                              cancel_flag: Optional[Dict] = None,
+                                              db=None) -> Dict[str, any]:
         """
         اجرای دسته‌جمعی سناریو چند ربات با قابلیت لغو و مکث
         
@@ -962,6 +1476,7 @@ class BotAutomation:
             bots_scenarios: لیست ربات‌ها و سناریوهایشان
             progress_callback: تابع callback برای نمایش پیشرفت
             cancel_flag: دیکشنری برای بررسی لغو/مکث عملیات
+            db: دیتابیس برای غیرفعال کردن سشن‌های نامعتبر
             
         Returns:
             دیکشنری حاوی نتایج
@@ -970,42 +1485,41 @@ class BotAutomation:
             'success': 0,
             'failed': 0,
             'cancelled': 0,
+            'invalid_sessions': 0,
             'details': []
         }
         
         total = len(session_paths)
         
         for index, session_path in enumerate(session_paths, 1):
-            # بررسی لغو عملیات
             if cancel_flag and cancel_flag.get('cancelled'):
                 logger.info(f"عملیات توسط کاربر لغو شد در مرحله {index}/{total}")
                 results['cancelled'] = total - index + 1
                 break
             
-            # بررسی مکث - صبر تا resume شود
             while cancel_flag and cancel_flag.get('paused'):
                 logger.info(f"عملیات در حالت مکث است، صبر می‌کنیم...")
-                await asyncio.sleep(1)  # هر 1 ثانیه چک می‌کنیم
+                await asyncio.sleep(1)
                 
-                # اگر در حین مکث لغو شد
                 if cancel_flag.get('cancelled'):
                     logger.info(f"عملیات در حین مکث لغو شد")
                     results['cancelled'] = total - index + 1
                     return results
             
-            # محاسبه تاخیر تصادفی
             delay = Config.DELAY_BETWEEN_ACTIONS + random.randint(0, Config.DELAY_RANDOM_RANGE)
             
-            # اگر callback داریم، پیشرفت رو نمایش بدیم
             if progress_callback:
                 await progress_callback(index, total, f"در حال اجرای سناریو {index}/{total}...")
             
             logger.info(f"اجرای سناریو چند ربات برای اکانت {index}/{total}")
             
-            result = await self.execute_multi_bot_scenario(session_path, bots_scenarios)
+            result = await self.execute_multi_bot_scenario(session_path, bots_scenarios, db=db)
             
             if result['success']:
                 results['success'] += 1
+            elif result.get('invalid_session'):
+                results['invalid_sessions'] += 1
+                results['failed'] += 1
             else:
                 results['failed'] += 1
             
@@ -1014,7 +1528,6 @@ class BotAutomation:
                 'result': result
             })
             
-            # تاخیر بین عملیات‌ها
             if index < total:
                 logger.info(f"صبر {delay} ثانیه قبل از عملیات بعدی...")
                 await asyncio.sleep(delay)

@@ -2,6 +2,7 @@
 import logging
 import asyncio
 import random
+import string
 from datetime import datetime
 from pathlib import Path
 from telethon import TelegramClient, events
@@ -44,6 +45,67 @@ class BotHandler:
         
         # قفل سشن‌ها - برای جلوگیری از استفاده همزمان از یک سشن
         self.session_locks = set()  # مجموعه session_path های در حال استفاده
+    
+    async def _handle_invalid_session(self, session_path: str, account=None):
+        """
+        غیرفعال کردن سشن نامعتبر در همه سرویس‌ها
+        
+        Args:
+            session_path: مسیر فایل سشن
+            account: آبجکت اکانت (اختیاری)
+        """
+        try:
+            await self.db.invalidate_session(session_path)
+            logger.warning(f"سشن نامعتبر غیرفعال و منتقل شد: {session_path}")
+        except Exception as e:
+            logger.error(f"خطا در غیرفعال کردن سشن: {e}")
+    
+    async def _check_and_invalidate(self, result: dict, session_path: str) -> bool:
+        """
+        بررسی نتیجه و غیرفعال کردن سشن نامعتبر اگر لازم بود
+        
+        Returns:
+            True اگر سشن نامعتبر بود
+        """
+        msg = result.get('message', '')
+        invalid_keywords = ['سشن نامعتبر', 'SESSION_REVOKED', 'AUTH_KEY_UNREGISTERED',
+                           'USER_DEACTIVATED', 'SESSION_EXPIRED', 'unauthorized']
+        
+        if not result.get('success') and any(k.lower() in msg.lower() for k in invalid_keywords):
+            await self._handle_invalid_session(session_path)
+            return True
+        return False
+    
+    async def _process_bulk_results_for_invalid_sessions(
+        self, results: dict, accounts: list
+    ) -> int:
+        """
+        بررسی نتایج bulk و غیرفعال کردن سشن‌های نامعتبر
+        
+        Args:
+            results: نتایج bulk operation
+            accounts: لیست اکانت‌ها
+            
+        Returns:
+            تعداد سشن‌های نامعتبر شناسایی شده
+        """
+        invalid_count = 0
+        invalid_keywords = [
+            'سشن نامعتبر', 'SESSION_REVOKED', 'AUTH_KEY_UNREGISTERED',
+            'USER_DEACTIVATED', 'SESSION_EXPIRED', 'unauthorized'
+        ]
+        
+        for i, detail in enumerate(results.get('details', [])):
+            result = detail.get('result', {})
+            if not result.get('success'):
+                msg = result.get('message', '')
+                if any(k.lower() in msg.lower() for k in invalid_keywords):
+                    # پیدا کردن session_path برای این اکانت
+                    if i < len(accounts) and accounts[i].session_path:
+                        await self.db.invalidate_session(accounts[i].session_path)
+                        invalid_count += 1
+        
+        return invalid_count
     
     def _lock_sessions(self, session_paths: list) -> tuple:
         """
@@ -220,203 +282,7 @@ class BotHandler:
         
         return custom_delay, time_limit_text
     
-    async def _execute_bulk_operation(self, event, user_id, state, operation_type: str, operation_func, **kwargs):
-        """
-        اجرای عملیات دسته‌جمعی با worker و time limit
-        
-        Args:
-            event: رویداد تلگرام
-            user_id: آیدی کاربر
-            state: وضعیت کاربر
-            operation_type: نوع عملیات (join, leave, referral, message, react, block, unblock)
-            operation_func: تابع اجرای عملیات
-            **kwargs: پارامترهای اضافی برای operation_func
-        """
-        selected_accounts = state['selected_accounts']
-        workers = state['workers']
-        custom_delay = state.get('custom_delay')
-        time_limit_text = state.get('time_limit_text', '')
-        
-        total = len(selected_accounts)
-        
-        # تعیین تاخیر نهایی
-        if custom_delay is not None:
-            delay_text = f"⏱ تاخیر: ~{custom_delay} ثانیه (محاسبه شده)\n"
-        else:
-            delay_text = f"⏱ تاخیر: {Config.DELAY_BETWEEN_ACTIONS}-{Config.DELAY_BETWEEN_ACTIONS + Config.DELAY_RANDOM_RANGE} ثانیه (پیش‌فرض)\n"
-        
-        # نام عملیات برای نمایش
-        operation_names = {
-            'join': 'جوین',
-            'leave': 'لفت',
-            'referral': 'استارت رفرال',
-            'message': 'ارسال پیام',
-            'react': 'ری‌اکشن',
-            'view': 'سین',
-            'block': 'بلاک',
-            'unblock': 'انبلاک'
-        }
-        operation_name = operation_names.get(operation_type, 'عملیات')
-        
-        # ارسال پیام شروع
-        worker_text = f"⚡ همزمان: {workers} اکانت\n" if workers > 1 else ""
-        progress_msg = await event.respond(
-            f"⏳ **شروع عملیات {operation_name}**\n\n"
-            f"📊 تعداد اکانت‌ها: {total}\n"
-            f"{worker_text}"
-            f"{time_limit_text}"
-            f"{delay_text}\n"
-            f"لطفاً صبر کنید..."
-        )
-        
-        # تابع callback برای بروزرسانی پیشرفت
-        async def update_progress(current, total, message):
-            try:
-                await progress_msg.edit(
-                    f"⏳ **در حال {operation_name}...**\n\n"
-                    f"📊 پیشرفت: {current}/{total}\n"
-                    f"💬 {message}"
-                )
-            except:
-                pass
-        
-        # اجرای عملیات
-        session_paths = [acc.session_path for acc in selected_accounts]
-        
-        # فراخوانی تابع عملیات با پارامترها (اضافه کردن workers و custom_delay)
-        results = await operation_func(
-            session_paths,
-            progress_callback=update_progress,
-            workers=workers,
-            custom_delay=custom_delay,
-            **kwargs
-        )
-        
-        # نمایش نتایج
-        results_text = f"📊 **نتایج {operation_name}:**\n\n"
-        
-        for i, detail in enumerate(results['details'][:10], 1):  # نمایش 10 مورد اول
-            phone_short = selected_accounts[i-1].phone[-4:] if selected_accounts[i-1].phone else "****"
-            result = detail['result']
-            
-            if result['success']:
-                results_text += f"✅ {phone_short}: موفق\n"
-            else:
-                error_msg = result.get('message', 'خطا')[:30]
-                results_text += f"❌ {phone_short}: {error_msg}\n"
-        
-        if len(results['details']) > 10:
-            results_text += f"\n... و {len(results['details']) - 10} مورد دیگر\n"
-        
-        results_text += f"\n✅ موفق: {results['success']}\n"
-        results_text += f"❌ ناموفق: {results['failed']}"
-        
-        return results_text, progress_msg, results
-        
-        return results_text, progress_msg, results
-    
-    async def _handle_operation_flow(self, event, user_id, step: str, operation_type: str):
-        """
-        مدیریت جریان کامل یک عملیات (count -> workers -> time_limit -> execute)
-        
-        Args:
-            event: رویداد تلگرام
-            user_id: آیدی کاربر
-            step: مرحله فعلی
-            operation_type: نوع عملیات
-            
-        Returns:
-            True اگر عملیات تکمیل شد، False اگر باید ادامه یابد
-        """
-        state = self.user_states.get(user_id, {})
-        
-        # مرحله 1: دریافت تعداد اکانت
-        if step.endswith('_count'):
-            count_input = event.message.text.strip()
-            active_accounts = state['active_accounts']
-            
-            # تعیین تعداد اکانت
-            if count_input.lower() == '/all':
-                selected_accounts = active_accounts
-            else:
-                try:
-                    count = int(count_input)
-                    if count <= 0:
-                        await event.respond(
-                            "❌ تعداد باید بیشتر از صفر باشد!",
-                            buttons=Button.inline("❌ لغو", b"cancel")
-                        )
-                        return False
-                    selected_accounts = active_accounts[:min(count, len(active_accounts))]
-                except ValueError:
-                    await event.respond(
-                        "❌ لطفاً یک عدد معتبر یا /all ارسال کنید.",
-                        buttons=Button.inline("❌ لغو", b"cancel")
-                    )
-                    return False
-            
-            # ذخیره اکانت‌های انتخاب شده
-            state['selected_accounts'] = selected_accounts
-            
-            # پرسیدن تعداد worker
-            await self._ask_workers_count(event, user_id, len(selected_accounts), f'{operation_type}_workers')
-            return False
-        
-        # مرحله 2: دریافت تعداد worker
-        elif step.endswith('_workers'):
-            try:
-                workers = int(event.message.text.strip())
-                if workers < 1:
-                    await event.respond(
-                        "❌ تعداد باید حداقل 1 باشد!",
-                        buttons=Button.inline("❌ لغو", b"cancel")
-                    )
-                    return False
-                if workers > 20:
-                    await event.respond(
-                        "❌ حداکثر 20 worker مجاز است!",
-                        buttons=Button.inline("❌ لغو", b"cancel")
-                    )
-                    return False
-            except ValueError:
-                await event.respond(
-                    "❌ لطفاً یک عدد معتبر ارسال کنید (مثلاً 3)",
-                    buttons=Button.inline("❌ لغو", b"cancel")
-                )
-                return False
-            
-            # ذخیره تعداد worker
-            state['workers'] = workers
-            selected_accounts = state['selected_accounts']
-            
-            # پرسیدن بازه زمانی
-            await self._ask_time_limit(event, user_id, len(selected_accounts), workers, f'{operation_type}_time_limit')
-            return False
-        
-        # مرحله 3: دریافت بازه زمانی
-        elif step.endswith('_time_limit'):
-            text = event.message.text.strip()
-            selected_accounts = state['selected_accounts']
-            workers = state['workers']
-            
-            # پارس کردن بازه زمانی
-            try:
-                custom_delay, time_limit_text = self._parse_time_limit(text, len(selected_accounts), workers)
-            except ValueError as e:
-                await event.respond(
-                    f"❌ {str(e)}",
-                    buttons=Button.inline("❌ لغو", b"cancel")
-                )
-                return False
-            
-            # ذخیره تاخیر سفارشی
-            state['custom_delay'] = custom_delay
-            state['time_limit_text'] = time_limit_text
-            
-            # حالا آماده اجرا هستیم
-            return True
-        
-        return False
+    def _select_accounts(self, count_input: str, all_accounts: list) -> list:
         """
         انتخاب تعداد مشخصی از اکانت‌ها
         
@@ -438,6 +304,47 @@ class BotHandler:
             raise ValueError("تعداد باید بیشتر از صفر باشد")
         
         return all_accounts[:min(count, len(all_accounts))]
+    
+    def _create_country_buttons(self, countries: list) -> tuple:
+        """
+        ساخت دکمه‌های شیشه‌ای برای انتخاب کشور
+        
+        Args:
+            countries: لیست کشورها با تعداد اکانت‌ها
+            
+        Returns:
+            (متن پیام, دکمه‌ها)
+        """
+        from src.utils.countries import get_country_flag
+        from telethon import Button
+        
+        country_text = "🌍 **انتخاب کشور برای اجرای سناریو**\n\n"
+        country_text += f"📊 شما اکانت از **{len(countries)} کشور** مختلف دارید\n\n"
+        country_text += f"💡 روی کشور مورد نظر کلیک کنید:\n"
+        
+        # ساخت دکمه‌ها
+        buttons = []
+        
+        # دکمه‌های کشورها (2 تا در هر ردیف)
+        for i in range(0, len(countries), 2):
+            row = []
+            for j in range(2):
+                if i + j < len(countries):
+                    country = countries[i + j]
+                    flag = get_country_flag(country['country_code'])
+                    label = f"{flag} {country['country_code']} ({country['count']})"
+                    callback_data = f"country_{country['country_code']}"
+                    row.append(Button.inline(label, callback_data.encode()))
+            buttons.append(row)
+        
+        # دکمه همه کشورها
+        total_accounts = sum(c['count'] for c in countries)
+        buttons.append([Button.inline(f"🌍 همه کشورها ({total_accounts} اکانت)", b"all_countries")])
+        
+        # دکمه لغو
+        buttons.append([Button.inline("❌ لغو", b"cancel")])
+        
+        return country_text, buttons
     
     async def _check_admin_access(self, event) -> bool:
         """
@@ -477,6 +384,253 @@ class BotHandler:
             return False
         
         return True
+    
+    async def _apply_profiles_handler(self, event, apply_photo: bool, apply_bio: bool, apply_username: bool):
+        """
+        هندلر اعمال پروفایل‌ها
+        
+        Args:
+            event: رویداد callback
+            apply_photo: اعمال عکس پروفایل
+            apply_bio: اعمال بیو
+            apply_username: اعمال یوزرنیم
+        """
+        user_id = event.sender_id
+        
+        if user_id not in self.user_states:
+            await event.answer("❌ خطا! لطفاً دوباره تلاش کنید.", alert=True)
+            return
+        
+        await event.answer()
+        
+        state = self.user_states[user_id]
+        members = state.get('leech_members', [])
+        accounts = state.get('leech_accounts', [])
+        
+        if not members or not accounts:
+            await event.edit(
+                "❌ اطلاعات لیچ پیدا نشد.",
+                buttons=Button.inline("🔙 منوی اصلی", b"back_to_menu")
+            )
+            return
+        
+        # نمایش پیام شروع
+        progress_msg = await event.edit(
+            f"🔄 **در حال اعمال پروفایل‌ها...**\n\n"
+            f"👥 تعداد اکانت: {len(accounts)}\n"
+            f"📊 تعداد پروفایل: {len(members)}\n\n"
+            f"⏳ لطفاً صبر کنید...",
+            buttons=Button.inline("❌ لغو", b"cancel_scenario")
+        )
+        
+        # ذخیره flag برای لغو
+        cancel_flag = {'cancelled': False}
+        self.running_operations[user_id] = cancel_flag
+        
+        try:
+            # تابع callback برای نمایش پیشرفت
+            async def progress_callback(current, total, message):
+                try:
+                    await progress_msg.edit(
+                        f"🔄 **در حال اعمال پروفایل‌ها...**\n\n"
+                        f"👥 اکانت: {current}/{total}\n"
+                        f"📊 {message}",
+                        buttons=Button.inline("❌ لغو", b"cancel_scenario")
+                    )
+                except Exception as e:
+                    logger.error(f"خطا در بروزرسانی پیشرفت: {e}")
+            
+            # اعمال پروفایل‌ها
+            from src.services.profile_applier import ProfileApplier
+            applier = ProfileApplier()
+            
+            session_paths = [acc.session_path for acc in accounts]
+            
+            # شافل کردن اعضا برای تصادفی بودن
+            import random
+            shuffled_members = members.copy()
+            random.shuffle(shuffled_members)
+            
+            results = await applier.bulk_apply(
+                session_paths,
+                shuffled_members,
+                apply_photo=apply_photo,
+                apply_bio=apply_bio,
+                apply_username=apply_username,
+                progress_callback=progress_callback,
+                cancel_flag=cancel_flag
+            )
+            
+            # حذف flag
+            if user_id in self.running_operations:
+                del self.running_operations[user_id]
+            
+            # بررسی لغو
+            if cancel_flag.get('cancelled'):
+                await progress_msg.edit(
+                    "❌ **اعمال پروفایل لغو شد!**",
+                    buttons=Button.inline("🔙 منوی اصلی", b"back_to_menu")
+                )
+                del self.user_states[user_id]
+                return
+            
+            # نمایش نتیجه
+            await progress_msg.edit(
+                f"✅ **اعمال پروفایل تکمیل شد!**\n\n"
+                f"📊 **آمار:**\n"
+                f"• موفق: {results['success_count']}\n"
+                f"• ناموفق: {results['failed_count']}\n"
+                f"• کل: {results['total_accounts']}\n\n"
+                f"💡 پروفایل‌های جدید روی اکانت‌ها اعمال شد.",
+                buttons=[
+                    [Button.inline("👥 لیچ جدید", b"leecher")],
+                    [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
+                ]
+            )
+            
+            # پاک کردن state
+            del self.user_states[user_id]
+        
+        except Exception as e:
+            logger.exception(f"خطا در اعمال پروفایل: {e}")
+            
+            await progress_msg.edit(
+                f"❌ **خطا در اعمال پروفایل!**\n\n"
+                f"خطا: {str(e)[:100]}",
+                buttons=Button.inline("🔙 منوی اصلی", b"back_to_menu")
+            )
+            
+            # پاک کردن state و flag
+            if user_id in self.user_states:
+                del self.user_states[user_id]
+            if user_id in self.running_operations:
+                del self.running_operations[user_id]
+    
+    async def _apply_from_excel_handler(self, event, apply_photo: bool, apply_bio: bool, apply_username: bool):
+        """هندلر اعمال پروفایل از دیتابیس"""
+        user_id = event.sender_id
+
+        if user_id not in self.user_states:
+            await event.answer("❌ خطا! لطفاً دوباره تلاش کنید.", alert=True)
+            return
+
+        await event.answer()
+
+        state = self.user_states[user_id]
+        selected_accounts = state.get('selected_accounts', [])
+
+        if not selected_accounts:
+            await event.edit(
+                "❌ اطلاعات اکانت‌ها پیدا نشد.",
+                buttons=Button.inline("🔙 منوی اصلی", b"back_to_menu")
+            )
+            return
+
+        progress_msg = await event.edit(
+            f"🔄 **در حال اعمال پروفایل‌ها...**\n\n"
+            f"👥 تعداد اکانت: {len(selected_accounts)}\n"
+            f"🗄 منبع: دیتابیس پروفایل‌های شما\n\n"
+            f"⏳ لطفاً صبر کنید...",
+            buttons=Button.inline("❌ لغو", b"cancel_scenario")
+        )
+
+        cancel_flag = {'cancelled': False}
+        self.running_operations[user_id] = cancel_flag
+
+        try:
+            async def progress_callback(current, total, message):
+                try:
+                    await progress_msg.edit(
+                        f"🔄 **در حال اعمال پروفایل‌ها...**\n\n"
+                        f"👥 اکانت: {current}/{total}\n"
+                        f"📊 {message}",
+                        buttons=Button.inline("❌ لغو", b"cancel_scenario")
+                    )
+                except Exception as e:
+                    logger.error(f"خطا در بروزرسانی پیشرفت: {e}")
+
+            from src.services.profile_applier import ProfileApplier
+            applier = ProfileApplier()
+
+            session_paths = [acc.session_path for acc in selected_accounts]
+
+            results = await applier.bulk_apply_from_db(
+                session_paths=session_paths,
+                owner_user_id=user_id,
+                db=self.db,
+                apply_photo=apply_photo,
+                apply_bio=apply_bio,
+                apply_username=apply_username,
+                progress_callback=progress_callback,
+                cancel_flag=cancel_flag,
+            )
+
+            if user_id in self.running_operations:
+                del self.running_operations[user_id]
+
+            if cancel_flag.get('cancelled'):
+                await progress_msg.edit(
+                    "❌ **اعمال پروفایل لغو شد!**",
+                    buttons=Button.inline("🔙 منوی اصلی", b"back_to_menu")
+                )
+                del self.user_states[user_id]
+                return
+
+            stats = await self.db.get_profiles_stats(user_id)
+
+            # ── خلاصه نتیجه (۵ اکانت اول) ──────────────────────
+            details = results.get('details', [])
+            preview_lines = []
+            for d in details[:5]:
+                icon = "✅" if d['status'] == 'ok' else "❌"
+                acc_user_str = f"@{d['acc_user']}" if d['acc_user'] != '—' else 'بدون یوزرنیم'
+                line = f"{icon} `{d['acc_phone']}` | ID: `{d['acc_id']}` | {acc_user_str}"
+                line += f"\n     🎭 منبع ID: `{d['src_id']}` ← **{d['new_name']}**"
+                if d['new_user'] != '—':
+                    line += f" | @{d['new_user']}"
+                line += f"\n     📦 {d['applied']}"
+                preview_lines.append(line)
+            preview_text = "\n".join(preview_lines)
+            if len(details) > 5:
+                preview_text += f"\n_... و {len(details) - 5} اکانت دیگر_"
+
+            result_msg = (
+                f"✅ **اعمال پروفایل تکمیل شد!**\n\n"
+                f"📊 **نتیجه:**\n"
+                f"• موفق: {results['success_count']}\n"
+                f"• ناموفق: {results['failed_count']}\n"
+                f"• بدون پروفایل: {results['no_profile_count']}\n\n"
+                f"🗄 **پروفایل‌های باقی‌مانده:**\n"
+                f"• استفاده نشده: {stats['unused']}\n"
+                f"• استفاده شده: {stats['used']}\n\n"
+                f"📋 **نمونه تغییرات:**\n{preview_text}"
+            )
+
+            await progress_msg.edit(
+                result_msg,
+                buttons=[
+                    [Button.inline("📄 گزارش کامل TXT", b"apply_report_txt")],
+                    [Button.inline("🎨 اعمال مجدد", b"apply_profiles")],
+                    [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
+                ]
+            )
+
+            # ذخیره details در state برای دکمه گزارش
+            self.user_states[user_id] = {
+                'step': 'apply_done',
+                'apply_details': details,
+            }
+
+        except Exception as e:
+            logger.exception(f"خطا در اعمال پروفایل: {e}")
+            await progress_msg.edit(
+                f"❌ **خطا در اعمال پروفایل!**\n\nخطا: {str(e)[:100]}",
+                buttons=Button.inline("🔙 منوی اصلی", b"back_to_menu")
+            )
+            if user_id in self.user_states:
+                del self.user_states[user_id]
+            if user_id in self.running_operations:
+                del self.running_operations[user_id]
     
     async def start(self):
         """راه‌اندازی ربات"""
@@ -594,7 +748,9 @@ class BotHandler:
                      Button.inline("💬 ارسال پیام", b"send_message")],
                     [Button.inline("❤️ ری‌اکشن و سین", b"react_post"),
                      Button.inline("🚫 بلاک/انبلاک", b"block_user")],
-                    [Button.inline("🎯 سناریو پیشرفته", b"advanced_scenario")],
+                    [Button.inline("🎯 سناریو پیشرفته", b"advanced_scenario"),
+                     Button.inline("👥 لیچر", b"leecher")],
+                    [Button.inline("🎨 اعمال پروفایل", b"apply_profiles")],
                     [Button.inline("📝 یادداشت‌های من", b"my_notes")],
                     [Button.inline("⚙️ مدیریت ربات", b"bot_management")],
                     [Button.inline("👑 پنل ادمین", b"admin_panel")]
@@ -626,7 +782,9 @@ class BotHandler:
                      Button.inline("💬 ارسال پیام", b"send_message")],
                     [Button.inline("❤️ ری‌اکشن و سین", b"react_post"),
                      Button.inline("🚫 بلاک/انبلاک", b"block_user")],
-                    [Button.inline("🎯 سناریو پیشرفته", b"advanced_scenario")],
+                    [Button.inline("🎯 سناریو پیشرفته", b"advanced_scenario"),
+                     Button.inline("👥 لیچر", b"leecher")],
+                    [Button.inline("🎨 اعمال پروفایل", b"apply_profiles")],
                     [Button.inline("📝 یادداشت‌های من", b"my_notes")],
                     [Button.inline("⚙️ مدیریت ربات", b"bot_management")]
                 ]
@@ -786,6 +944,8 @@ class BotHandler:
                 [Button.inline("📱 همه اکانت‌ها", b"admin_accounts")],
                 [Button.inline("⏳ کاربران در انتظار", b"admin_pending")],
                 [Button.inline("👑 مدیریت ادمین‌ها", b"admin_manage")],
+                [Button.inline("🔐 تغییر پسورد خودکار", b"admin_auto_password")],
+                [Button.inline("📲 دریافت کد از سشن", b"admin_get_code")],
                 [Button.inline("💾 بکاپ کامل", b"admin_backup")],
                 [Button.inline("📥 ریستور بکاپ", b"admin_restore")],
                 [Button.inline("⚙️ تنظیم کانال بکاپ", b"admin_set_backup_channel")],
@@ -893,6 +1053,150 @@ class BotHandler:
                 buttons=Button.inline("🔙 بازگشت", b"admin_panel")
             )
         
+        @self.bot.on(events.CallbackQuery(pattern=b"admin_auto_password"))
+        async def admin_auto_password_callback(event):
+            """تنظیمات تغییر پسورد خودکار"""
+            # فقط سازنده دسترسی داره
+            if not await self._check_creator_access(event):
+                return
+            
+            await event.answer()
+            
+            # دریافت وضعیت فعلی
+            current_status = await self.db.get_setting('auto_change_password')
+            password_mode = await self.db.get_setting('password_mode') or 'random'
+            default_password = await self.db.get_setting('default_password') or 'نامشخص'
+            
+            is_enabled = current_status == 'enabled'
+            
+            status_text = "✅ فعال" if is_enabled else "❌ غیرفعال"
+            status_emoji = "🟢" if is_enabled else "🔴"
+            
+            mode_text = "🎲 رندوم" if password_mode == 'random' else f"🔒 دیفالت (`{default_password}`)"
+            
+            text = (
+                f"🔐 **تغییر خودکار پسورد اکانت‌ها**\n\n"
+                f"وضعیت: {status_emoji} {status_text}\n"
+                f"حالت پسورد: {mode_text}\n\n"
+                f"📝 **توضیحات:**\n"
+                f"• هنگام افزودن اکانت جدید، پسورد آن به صورت خودکار تغییر می‌کند\n"
+                f"• پسورد در دیتابیس ذخیره می‌شود\n"
+                f"• پسورد همراه با سشن به کانال بکاپ ارسال می‌شود\n\n"
+                f"🎲 **رندوم:** هر بار پسورد جدید تولید می‌شود (10-14 کاراکتر)\n"
+                f"🔒 **دیفالت:** همیشه از یک پسورد ثابت استفاده می‌شود\n\n"
+            )
+            
+            toggle_button_text = "❌ غیرفعال کردن" if is_enabled else "✅ فعال کردن"
+            toggle_button_data = b"toggle_auto_password_off" if is_enabled else b"toggle_auto_password_on"
+            
+            # دکمه‌های حالت با نشانگر فعال بودن
+            random_btn_text = "✅ 🎲 رندوم" if password_mode == 'random' else "🎲 رندوم"
+            default_btn_text = "✅ 🔒 دیفالت" if password_mode == 'default' else "🔒 دیفالت"
+            
+            buttons = [
+                [Button.inline(toggle_button_text, toggle_button_data)],
+                [
+                    Button.inline(random_btn_text, b"password_mode_random"),
+                    Button.inline(default_btn_text, b"password_mode_default")
+                ],
+                [Button.inline("✏️ تنظیم پسورد دیفالت", b"set_default_password")],
+                [Button.inline("🔙 بازگشت", b"admin_panel")]
+            ]
+            
+            await event.edit(text, buttons=buttons)
+        
+        @self.bot.on(events.CallbackQuery(pattern=b"toggle_auto_password_"))
+        async def toggle_auto_password_callback(event):
+            """تغییر وضعیت تغییر پسورد خودکار"""
+            # فقط سازنده دسترسی داره
+            if not await self._check_creator_access(event):
+                return
+            
+            await event.answer()
+            
+            # تشخیص عملیات (فعال یا غیرفعال)
+            action = event.data.decode().split('_')[-1]  # 'on' or 'off'
+            
+            if action == 'on':
+                await self.db.set_setting('auto_change_password', 'enabled')
+            else:
+                await self.db.set_setting('auto_change_password', 'disabled')
+            
+            # بازگشت به منوی تنظیمات پسورد
+            await admin_auto_password_callback(event)
+        
+        @self.bot.on(events.CallbackQuery(pattern=b"password_mode_"))
+        async def password_mode_callback(event):
+            """تغییر حالت پسورد (رندوم یا دیفالت)"""
+            # فقط سازنده دسترسی داره
+            if not await self._check_creator_access(event):
+                return
+            
+            await event.answer()
+            
+            # تشخیص حالت
+            mode = event.data.decode().split('_')[-1]  # 'random' or 'default'
+            
+            await self.db.set_setting('password_mode', mode)
+            
+            # بازگشت به منوی تنظیمات پسورد
+            await admin_auto_password_callback(event)
+        
+        @self.bot.on(events.CallbackQuery(pattern=b"set_default_password"))
+        async def set_default_password_callback(event):
+            """شروع فرآیند تنظیم پسورد دیفالت"""
+            # فقط سازنده دسترسی داره
+            if not await self._check_creator_access(event):
+                return
+            
+            await event.answer()
+            
+            user_id = event.sender_id
+            self.user_states[user_id] = {'step': 'set_default_password'}
+            
+            await event.edit(
+                "🔒 **تنظیم پسورد دیفالت**\n\n"
+                "لطفاً پسورد دیفالت را ارسال کنید:\n\n"
+                "📝 **نکات:**\n"
+                "• از حروف انگلیسی (a-z, A-Z)، اعداد (0-9) و @ استفاده کنید\n"
+                "• حداقل 8 کاراکتر\n"
+                "• بدون فاصله\n\n"
+                "مثال: `MyPass@2024`",
+                buttons=Button.inline("❌ لغو", b"admin_auto_password")
+            )
+        
+        @self.bot.on(events.CallbackQuery(pattern=b"admin_get_code"))
+        async def admin_get_code_callback(event):
+            """شروع فرآیند دریافت کد از سشن"""
+            if not await self._check_creator_access(event):
+                return
+            await event.answer()
+            user_id = event.sender_id
+            self.user_states[user_id] = {'step': 'get_code_phone'}
+            await event.edit(
+                "📲 **دریافت کد تایید از سشن**\n\n"
+                "شماره اکانت را وارد کنید:\n"
+                "_(مثلاً: `+989123456789`)_\n\n"
+                "💡 بعد از ارسال شماره، ربات سشن رو فعال نگه می‌داره و\n"
+                "به محض رسیدن کد جدید (از تلگرام) آن را نمایش می‌دهد.\n"
+                "⏱ حداکثر 120 ثانیه صبر می‌کند.",
+                buttons=Button.inline("🔙 بازگشت", b"admin_panel")
+            )
+        
+        @self.bot.on(events.CallbackQuery(pattern=b"get_code_wait_mode"))
+        async def get_code_wait_mode_callback(event):
+            """تغییر حالت به انتظار کد جدید - دیگه استفاده نمی‌شه ولی برای backward compat نگه داریم"""
+            if not await self._check_creator_access(event):
+                return
+            await event.answer()
+            user_id = event.sender_id
+            self.user_states[user_id] = {'step': 'get_code_phone'}
+            await event.edit(
+                "📲 **دریافت کد تایید از سشن**\n\n"
+                "شماره اکانت را وارد کنید:",
+                buttons=Button.inline("🔙 بازگشت", b"admin_panel")
+            )
+
         @self.bot.on(events.CallbackQuery(pattern=b"admin_pending"))
         async def admin_pending_callback(event):
             """نمایش کاربران در انتظار تایید"""
@@ -1559,10 +1863,11 @@ class BotHandler:
                 "یوزرنیم/آیدی → بلاک یا انبلاک خودکار\n\n"
                 "**🎯 سناریو پیشرفته:**\n"
                 "سناریوی کامل برای تعامل با ربات‌ها\n"
-                "• دستورات: start, send, click, solve_captcha, share_phone, join, leave, wait, stop, forward\n"
+                "• دستورات: start, send, click, solve_captcha, share_phone, join, leave, auto_join, wait, stop, forward\n"
                 "• کلیک دکمه: با متن یا شماره (click: #0, click: 1)\n"
                 "• حل کپچا: solve_captcha: send یا solve_captcha: click یا solve_captcha: send, 3\n"
                 "• اشتراک شماره: share_phone: (خودکار شماره اکانت رو میفرسته)\n"
+                "• جوین خودکار: auto_join (جوین همه کانال‌های پیام + کلیک آخرین دکمه)\n"
                 "• توقف موقت: stop: 5 (5 ثانیه توقف)\n"
                 "• فوروارد نتایج: forward: 5, @mychannel\n"
                 "• متغیرهای دینامیک: {random:N}, {random_upper:N}, {random_num:N}\n"
@@ -1588,10 +1893,21 @@ class BotHandler:
             """لغو عملیات"""
             await event.answer()
             
+            user_id = event.sender_id
+            
+            # لغو عملیات در حال اجرا (اگر وجود داشته باشد)
+            if user_id in self.running_operations:
+                self.running_operations[user_id]['cancelled'] = True
+                # صبر کمی تا task پس‌زمینه متوجه لغو بشه
+                await asyncio.sleep(0.5)
+                # حذف flag
+                if user_id in self.running_operations:
+                    del self.running_operations[user_id]
+            
             # لغو فرآیند ورود اگر در حال انجام است
-            if event.sender_id in self.user_states:
-                await self.receiver.cancel_login(event.sender_id)
-                del self.user_states[event.sender_id]
+            if user_id in self.user_states:
+                await self.receiver.cancel_login(user_id)
+                del self.user_states[user_id]
             
             # بازگشت به منوی اصلی
             user = await event.get_sender()
@@ -1611,7 +1927,10 @@ class BotHandler:
                      Button.inline("💬 ارسال پیام", b"send_message")],
                     [Button.inline("❤️ ری‌اکشن و سین", b"react_post"),
                      Button.inline("🚫 بلاک/انبلاک", b"block_user")],
-                    [Button.inline("🎯 سناریو پیشرفته", b"advanced_scenario")],
+                    [Button.inline("🎯 سناریو پیشرفته", b"advanced_scenario"),
+                     Button.inline("👥 لیچر", b"leecher")],
+                    [Button.inline("🎨 اعمال پروفایل", b"apply_profiles")],
+                    [Button.inline("📝 یادداشت‌های من", b"my_notes")],
                     [Button.inline("⚙️ مدیریت ربات", b"bot_management")],
                     [Button.inline("👑 پنل ادمین", b"admin_panel")]
                 ]
@@ -1626,7 +1945,10 @@ class BotHandler:
                      Button.inline("💬 ارسال پیام", b"send_message")],
                     [Button.inline("❤️ ری‌اکشن و سین", b"react_post"),
                      Button.inline("🚫 بلاک/انبلاک", b"block_user")],
-                    [Button.inline("🎯 سناریو پیشرفته", b"advanced_scenario")],
+                    [Button.inline("🎯 سناریو پیشرفته", b"advanced_scenario"),
+                     Button.inline("👥 لیچر", b"leecher")],
+                    [Button.inline("🎨 اعمال پروفایل", b"apply_profiles")],
+                    [Button.inline("📝 یادداشت‌های من", b"my_notes")],
                     [Button.inline("⚙️ مدیریت ربات", b"bot_management")]
                 ]
             else:
@@ -1732,44 +2054,179 @@ class BotHandler:
                     # ورود موفق
                     target_user_id = state.get('target_user_id', user_id)
                     
-                    account = Account(
-                        user_id=target_user_id,  # ذخیره برای کاربر هدف
-                        phone=state['phone'],
-                        telegram_user_id=result['user_id'],
-                        telegram_username=result.get('username'),
-                        session_path=result['session_path'],
-                        status='active',
-                        added_by=user_id  # کسی که اکانت رو اضافه کرده
-                    )
-                    await self.db.add_account(account)
-                    await self.db.log_action('account_added', user_id, f"{state['phone']} -> user:{target_user_id}")
+                    # تشخیص کد کشور از روی شماره
+                    from src.utils.countries import detect_country_from_phone
+                    country_code = detect_country_from_phone(state['phone'])
+                    
+                    # بررسی تنظیمات تغییر خودکار پسورد
+                    auto_change_password = await self.db.get_setting('auto_change_password')
+                    new_password = None
+                    password_changed = False
+                    
+                    if auto_change_password == 'enabled':
+                        try:
+                            # دریافت حالت پسورد (رندوم یا دیفالت)
+                            password_mode = await self.db.get_setting('password_mode') or 'random'
+                            
+                            if password_mode == 'default':
+                                # استفاده از پسورد دیفالت
+                                new_password = await self.db.get_setting('default_password')
+                                
+                                if not new_password:
+                                    # اگر پسورد دیفالت تنظیم نشده، از رندوم استفاده می‌کنیم
+                                    logger.warning("پسورد دیفالت تنظیم نشده، از حالت رندوم استفاده می‌شود")
+                                    password_mode = 'random'
+                            
+                            if password_mode == 'random':
+                                # تولید پسورد قوی و ایمن (فقط حروف و اعداد - قابل قبول توسط تلگرام)
+                                password_length = random.randint(10, 14)
+                                # فقط حروف بزرگ، کوچک و اعداد (بدون کاراکترهای خاص)
+                                new_password = ''.join(random.choices(
+                                    string.ascii_letters + string.digits, 
+                                    k=password_length
+                                ))
+                            
+                            # ذخیره پسورد قبل از تغییر (برای بازیابی در صورت خطا)
+                            temp_password = new_password
+                            
+                            # تغییر پسورد اکانت
+                            await event.respond(f"🔐 در حال تغییر پسورد اکانت... (حالت: {password_mode})")
+                            password_result = await self.receiver.change_account_password(
+                                result['session_path'],
+                                new_password
+                            )
+                            
+                            if password_result['success']:
+                                password_changed = True
+                                logger.info(f"پسورد اکانت {state['phone']} با موفقیت تغییر کرد (حالت: {password_mode})")
+                            else:
+                                # اگر تغییر پسورد موفق نبود، پسورد رو null می‌ذاریم
+                                new_password = None
+                                
+                                # بررسی اینکه آیا اکانت قبلاً پسورد داشته یا نه
+                                if password_result.get('has_password'):
+                                    logger.info(f"اکانت {state['phone']} قبلاً پسورد دارد، پسورد تغییر نمی‌کند")
+                                    # فقط به ادمین اطلاع می‌دیم
+                                    if user_id in Config.ADMIN_IDS or user_id == target_user_id:
+                                        await event.respond(
+                                            f"ℹ️ این اکانت قبلاً پسورد دارد.\n"
+                                            f"اکانت بدون تغییر پسورد ذخیره می‌شود."
+                                        )
+                                else:
+                                    logger.warning(f"تغییر پسورد ناموفق: {password_result['message']}")
+                                    # فقط به ادمین اطلاع می‌دیم
+                                    if user_id in Config.ADMIN_IDS or user_id == target_user_id:
+                                        await event.respond(
+                                            f"⚠️ تغییر پسورد ناموفق بود: {password_result['message']}\n"
+                                            f"اکانت بدون تغییر پسورد ذخیره می‌شود."
+                                        )
+                        except Exception as e:
+                            # در صورت هر خطایی، پسورد رو null می‌ذاریم
+                            new_password = None
+                            logger.exception(f"خطا در فرآیند تغییر پسورد: {e}")
+                            if user_id in Config.ADMIN_IDS or user_id == target_user_id:
+                                await event.respond(
+                                    f"⚠️ خطا در تغییر پسورد: {str(e)}\n"
+                                    f"اکانت بدون تغییر پسورد ذخیره می‌شود."
+                                )
+                    
+                    # بررسی تکراری نبودن اکانت (ورود با کد)
+                    existing = await self.db.get_account_by_phone(state['phone'])
+                    if existing:
+                        import os as _os
+                        try:
+                            _os.remove(result['session_path'])
+                        except:
+                            pass
+                        state['step'] = 'phone'
+                        await event.respond(
+                            f"⚠️ **این اکانت قبلاً ثبت شده است!**\n\n"
+                            f"📱 شماره: {state['phone']}\n"
+                            f"🆔 یوزرنیم: @{existing.telegram_username or 'ندارد'}\n"
+                            f"📅 تاریخ ثبت: {existing.created_at[:10] if existing.created_at else 'نامشخص'}\n\n"
+                            f"📱 برای افزودن اکانت دیگری شماره تلفن را ارسال کنید.\n"
+                            f"یا /cancel برای بازگشت به منوی اصلی.",
+                            buttons=Button.inline("🔙 منوی اصلی", b"back_to_menu")
+                        )
+                        return
+                    
+                    # ذخیره اکانت در دیتابیس (حتی اگر تغییر پسورد ناموفق باشد)
+                    try:
+                        account = Account(
+                            user_id=target_user_id,  # ذخیره برای کاربر هدف
+                            phone=state['phone'],
+                            telegram_user_id=result['user_id'],
+                            telegram_username=result.get('username'),
+                            session_path=result['session_path'],
+                            status='active',
+                            added_by=user_id,  # کسی که اکانت رو اضافه کرده
+                            country_code=country_code if country_code != 'UNKNOWN' else None,
+                            password=new_password  # پسورد جدید (اگر تغییر داده شده باشد)
+                        )
+                        await self.db.add_account(account)
+                        await self.db.log_action('account_added', user_id, f"{state['phone']} -> user:{target_user_id} (password_changed: {password_changed})")
+                        logger.info(f"اکانت {state['phone']} با موفقیت در دیتابیس ذخیره شد")
+                    except Exception as e:
+                        logger.exception(f"خطا در ذخیره اکانت در دیتابیس: {e}")
+                        await event.respond(
+                            f"❌ خطا در ذخیره اکانت: {str(e)}\n"
+                            f"لطفاً با پشتیبانی تماس بگیرید."
+                        )
+                        return
                     
                     # آپلود سشن به کانال بکاپ (اگر تنظیم شده باشد)
                     if self.backup_manager.backup_channel_id:
-                        asyncio.create_task(
-                            self.backup_manager.upload_session_to_channel(
-                                result['session_path'],
-                                state['phone'],
-                                result.get('username')
+                        try:
+                            asyncio.create_task(
+                                self.backup_manager.upload_session_to_channel(
+                                    result['session_path'],
+                                    state['phone'],
+                                    result.get('username'),
+                                    new_password  # ارسال پسورد به کانال بکاپ
+                                )
                             )
-                        )
+                            logger.info(f"سشن {state['phone']} برای آپلود به کانال بکاپ ارسال شد")
+                        except Exception as e:
+                            logger.exception(f"خطا در ارسال سشن به کانال بکاپ: {e}")
                     
                     # بازگشت به مرحله دریافت شماره برای اکانت بعدی
                     state['step'] = 'phone'
                     
                     # پیام متفاوت برای ادمین و کاربر عادی
+                    # فقط به ادمین پسورد نشون داده می‌شه
+                    is_admin_user = user_id in Config.ADMIN_IDS
+                    password_info = ""
+                    
+                    if new_password and is_admin_user:
+                        password_info = f"\n🔐 پسورد جدید: `{new_password}`"
+                    
                     if target_user_id == user_id:
-                        success_msg = (
-                            f"✅ **ورود موفق!**\n\n"
-                            f"👤 نام: {result.get('first_name', 'نامشخص')}\n"
-                            f"🆔 یوزرنیم: @{result.get('username') or 'ندارد'}\n"
-                            f"📱 شماره: {state['phone']}\n"
-                            f"📁 سشن ذخیره شد\n\n"
-                            f"✨ **اکانت شما با موفقیت ثبت شد!**\n\n"
-                            f"📱 برای افزودن اکانت بعدی، شماره تلفن را ارسال کنید.\n"
-                            f"یا /cancel برای بازگشت به منوی اصلی."
-                        )
+                        # کاربر برای خودش اکانت اضافه کرده
+                        if is_admin_user:
+                            success_msg = (
+                                f"✅ **ورود موفق!**\n\n"
+                                f"👤 نام: {result.get('first_name', 'نامشخص')}\n"
+                                f"🆔 یوزرنیم: @{result.get('username') or 'ندارد'}\n"
+                                f"📱 شماره: {state['phone']}\n"
+                                f"📁 سشن ذخیره شد{password_info}\n\n"
+                                f"✨ **اکانت شما با موفقیت ثبت شد!**\n\n"
+                                f"📱 برای افزودن اکانت بعدی، شماره تلفن را ارسال کنید.\n"
+                                f"یا /cancel برای بازگشت به منوی اصلی."
+                            )
+                        else:
+                            # کاربر عادی - بدون نمایش پسورد
+                            success_msg = (
+                                f"✅ **ورود موفق!**\n\n"
+                                f"👤 نام: {result.get('first_name', 'نامشخص')}\n"
+                                f"🆔 یوزرنیم: @{result.get('username') or 'ندارد'}\n"
+                                f"📱 شماره: {state['phone']}\n"
+                                f"📁 سشن ذخیره شد\n\n"
+                                f"✨ **اکانت شما با موفقیت ثبت شد!**\n\n"
+                                f"📱 برای افزودن اکانت بعدی، شماره تلفن را ارسال کنید.\n"
+                                f"یا /cancel برای بازگشت به منوی اصلی."
+                            )
                     else:
+                        # کاربر عادی برای ادمین اکانت اضافه کرده
                         success_msg = (
                             f"✅ **ورود موفق!**\n\n"
                             f"👤 نام: {result.get('first_name', 'نامشخص')}\n"
@@ -1801,6 +2258,9 @@ class BotHandler:
                 # دریافت رمز دو مرحله‌ای
                 password = event.message.text.strip()
                 
+                # ذخیره پسورد فعلی در state برای استفاده بعدی (تغییر پسورد)
+                state['current_password'] = password
+                
                 await event.respond("⏳ در حال بررسی رمز...")
                 
                 result = await self.receiver.sign_in_with_password(
@@ -1823,43 +2283,169 @@ class BotHandler:
                     # ورود موفق
                     target_user_id = state.get('target_user_id', user_id)
                     
-                    account = Account(
-                        user_id=target_user_id,  # ذخیره برای کاربر هدف
-                        phone=state.get('phone', 'unknown'),
-                        telegram_user_id=result['user_id'],
-                        telegram_username=result.get('username'),
-                        session_path=result['session_path'],
-                        status='active',
-                        added_by=user_id  # کسی که اکانت رو اضافه کرده
-                    )
-                    await self.db.add_account(account)
-                    await self.db.log_action('account_added', user_id, f"{state.get('phone')} -> user:{target_user_id}")
+                    # تشخیص کد کشور از روی شماره
+                    from src.utils.countries import detect_country_from_phone
+                    phone = state.get('phone', 'unknown')
+                    country_code = detect_country_from_phone(phone) if phone != 'unknown' else None
+                    
+                    # بررسی تنظیمات تغییر خودکار پسورد
+                    auto_change_password = await self.db.get_setting('auto_change_password')
+                    new_password = None
+                    password_changed = False
+                    
+                    if auto_change_password == 'enabled':
+                        try:
+                            # دریافت حالت پسورد (رندوم یا دیفالت)
+                            password_mode = await self.db.get_setting('password_mode') or 'random'
+                            
+                            if password_mode == 'default':
+                                # استفاده از پسورد دیفالت
+                                new_password = await self.db.get_setting('default_password')
+                                
+                                if not new_password:
+                                    logger.warning("پسورد دیفالت تنظیم نشده، از حالت رندوم استفاده می‌شود")
+                                    password_mode = 'random'
+                            
+                            if password_mode == 'random':
+                                password_length = random.randint(10, 14)
+                                new_password = ''.join(random.choices(
+                                    string.ascii_letters + string.digits, 
+                                    k=password_length
+                                ))
+                            
+                            # پسورد فعلی اکانت (که کاربر موقع لاگین وارد کرده)
+                            current_account_password = state.get('current_password')
+                            
+                            # تغییر پسورد اکانت
+                            password_result = await self.receiver.change_account_password(
+                                result['session_path'],
+                                new_password,
+                                current_password=current_account_password  # پسورد فعلی برای اکانت‌هایی که پسورد دارن
+                            )
+                            
+                            if password_result['success']:
+                                password_changed = True
+                                logger.info(f"پسورد اکانت {phone} با موفقیت تغییر کرد (حالت: {password_mode})")
+                            else:
+                                new_password = None
+                                if password_result.get('has_password'):
+                                    logger.info(f"اکانت {phone} قبلاً پسورد دارد، پسورد تغییر نمی‌کند")
+                                    if user_id in Config.ADMIN_IDS or user_id == target_user_id:
+                                        await event.respond(
+                                            f"ℹ️ این اکانت قبلاً پسورد دارد.\n"
+                                            f"اکانت بدون تغییر پسورد ذخیره می‌شود."
+                                        )
+                                else:
+                                    logger.warning(f"تغییر پسورد ناموفق: {password_result['message']}")
+                                    if user_id in Config.ADMIN_IDS or user_id == target_user_id:
+                                        await event.respond(
+                                            f"⚠️ تغییر پسورد ناموفق بود: {password_result['message']}\n"
+                                            f"اکانت بدون تغییر پسورد ذخیره می‌شود."
+                                        )
+                        except Exception as e:
+                            new_password = None
+                            logger.exception(f"خطا در فرآیند تغییر پسورد: {e}")
+                            if user_id in Config.ADMIN_IDS or user_id == target_user_id:
+                                await event.respond(
+                                    f"⚠️ خطا در تغییر پسورد: {str(e)}\n"
+                                    f"اکانت بدون تغییر پسورد ذخیره می‌شود."
+                                )
+                    
+                    # بررسی تکراری نبودن اکانت (ورود با پسورد 2FA)
+                    existing = await self.db.get_account_by_phone(phone)
+                    if existing:
+                        import os as _os
+                        try:
+                            _os.remove(result['session_path'])
+                        except:
+                            pass
+                        state['step'] = 'phone'
+                        await event.respond(
+                            f"⚠️ **این اکانت قبلاً ثبت شده است!**\n\n"
+                            f"📱 شماره: {phone}\n"
+                            f"🆔 یوزرنیم: @{existing.telegram_username or 'ندارد'}\n"
+                            f"📅 تاریخ ثبت: {existing.created_at[:10] if existing.created_at else 'نامشخص'}\n\n"
+                            f"📱 برای افزودن اکانت دیگری شماره تلفن را ارسال کنید.\n"
+                            f"یا /cancel برای بازگشت به منوی اصلی.",
+                            buttons=Button.inline("🔙 منوی اصلی", b"back_to_menu")
+                        )
+                        return
+                    
+                    # ذخیره اکانت در دیتابیس (حتی اگر تغییر پسورد ناموفق باشد)
+                    try:
+                        account = Account(
+                            user_id=target_user_id,  # ذخیره برای کاربر هدف
+                            phone=phone,
+                            telegram_user_id=result['user_id'],
+                            telegram_username=result.get('username'),
+                            session_path=result['session_path'],
+                            status='active',
+                            added_by=user_id,  # کسی که اکانت رو اضافه کرده
+                            country_code=country_code if country_code and country_code != 'UNKNOWN' else None,
+                            password=new_password  # پسورد جدید (اگر تغییر داده شده باشد)
+                        )
+                        await self.db.add_account(account)
+                        await self.db.log_action('account_added', user_id, f"{phone} -> user:{target_user_id} (password_changed: {password_changed})")
+                        logger.info(f"اکانت {phone} با موفقیت در دیتابیس ذخیره شد")
+                    except Exception as e:
+                        logger.exception(f"خطا در ذخیره اکانت در دیتابیس: {e}")
+                        await event.respond(
+                            f"❌ خطا در ذخیره اکانت: {str(e)}\n"
+                            f"لطفاً با پشتیبانی تماس بگیرید."
+                        )
+                        return
                     
                     # آپلود سشن به کانال بکاپ (اگر تنظیم شده باشد)
                     if self.backup_manager.backup_channel_id:
-                        asyncio.create_task(
-                            self.backup_manager.upload_session_to_channel(
-                                result['session_path'],
-                                state.get('phone', 'unknown'),
-                                result.get('username')
+                        try:
+                            asyncio.create_task(
+                                self.backup_manager.upload_session_to_channel(
+                                    result['session_path'],
+                                    state.get('phone', 'unknown'),
+                                    result.get('username'),
+                                    new_password  # ارسال پسورد به کانال بکاپ
+                                )
                             )
-                        )
+                            logger.info(f"سشن {phone} برای آپلود به کانال بکاپ ارسال شد")
+                        except Exception as e:
+                            logger.exception(f"خطا در ارسال سشن به کانال بکاپ: {e}")
                     
                     # بازگشت به مرحله دریافت شماره برای اکانت بعدی
                     state['step'] = 'phone'
                     
                     # پیام متفاوت برای ادمین و کاربر عادی
+                    # فقط به ادمین پسورد نشون داده می‌شه
+                    is_admin_user = user_id in Config.ADMIN_IDS
+                    password_info = ""
+                    
+                    if new_password and is_admin_user:
+                        password_info = f"\n🔐 پسورد جدید: `{new_password}`"
+                    
                     if target_user_id == user_id:
-                        success_msg = (
-                            f"✅ **ورود موفق!**\n\n"
-                            f"👤 نام: {result.get('first_name', 'نامشخص')}\n"
-                            f"🆔 یوزرنیم: @{result.get('username') or 'ندارد'}\n"
-                            f"📁 سشن ذخیره شد\n\n"
-                            f"✨ **اکانت شما با موفقیت ثبت شد!**\n\n"
-                            f"📱 برای افزودن اکانت بعدی، شماره تلفن را ارسال کنید.\n"
-                            f"یا /cancel برای بازگشت به منوی اصلی."
-                        )
+                        # کاربر برای خودش اکانت اضافه کرده
+                        if is_admin_user:
+                            success_msg = (
+                                f"✅ **ورود موفق!**\n\n"
+                                f"👤 نام: {result.get('first_name', 'نامشخص')}\n"
+                                f"🆔 یوزرنیم: @{result.get('username') or 'ندارد'}\n"
+                                f"📁 سشن ذخیره شد{password_info}\n\n"
+                                f"✨ **اکانت شما با موفقیت ثبت شد!**\n\n"
+                                f"📱 برای افزودن اکانت بعدی، شماره تلفن را ارسال کنید.\n"
+                                f"یا /cancel برای بازگشت به منوی اصلی."
+                            )
+                        else:
+                            # کاربر عادی - بدون نمایش پسورد
+                            success_msg = (
+                                f"✅ **ورود موفق!**\n\n"
+                                f"👤 نام: {result.get('first_name', 'نامشخص')}\n"
+                                f"🆔 یوزرنیم: @{result.get('username') or 'ندارد'}\n"
+                                f"📁 سشن ذخیره شد\n\n"
+                                f"✨ **اکانت شما با موفقیت ثبت شد!**\n\n"
+                                f"📱 برای افزودن اکانت بعدی، شماره تلفن را ارسال کنید.\n"
+                                f"یا /cancel برای بازگشت به منوی اصلی."
+                            )
                     else:
+                        # کاربر عادی برای ادمین اکانت اضافه کرده
                         success_msg = (
                             f"✅ **ورود موفق!**\n\n"
                             f"👤 نام: {result.get('first_name', 'نامشخص')}\n"
@@ -1883,6 +2469,139 @@ class BotHandler:
                         buttons=Button.inline("❌ لغو", b"cancel")
                     )
                     await self.db.log_action('password_failed', user_id, result['message'])
+
+            elif step == 'set_default_password':
+                # دریافت پسورد دیفالت از ادمین
+                password_text = event.message.text.strip()
+                
+                # اعتبارسنجی پسورد
+                import re
+                
+                # حروف انگلیسی، اعداد و @ مجاز هستند
+                if not re.match(r'^[a-zA-Z0-9@]+$', password_text):
+                    await event.respond(
+                        "❌ **پسورد نامعتبر!**\n\n"
+                        "فقط از حروف انگلیسی (a-z, A-Z)، اعداد (0-9) و @ استفاده کنید.\n"
+                        "بدون فاصله و کاراکترهای خاص دیگر.\n\n"
+                        "لطفاً دوباره تلاش کنید:",
+                        buttons=Button.inline("❌ لغو", b"admin_auto_password")
+                    )
+                    return
+                
+                # حداقل 8 کاراکتر
+                if len(password_text) < 8:
+                    await event.respond(
+                        "❌ **پسورد خیلی کوتاه است!**\n\n"
+                        "پسورد باید حداقل 8 کاراکتر باشد.\n\n"
+                        "لطفاً دوباره تلاش کنید:",
+                        buttons=Button.inline("❌ لغو", b"admin_auto_password")
+                    )
+                    return
+                
+                # حداکثر 32 کاراکتر
+                if len(password_text) > 32:
+                    await event.respond(
+                        "❌ **پسورد خیلی بلند است!**\n\n"
+                        "پسورد باید حداکثر 32 کاراکتر باشد.\n\n"
+                        "لطفاً دوباره تلاش کنید:",
+                        buttons=Button.inline("❌ لغو", b"admin_auto_password")
+                    )
+                    return
+                
+                # ذخیره پسورد دیفالت
+                await self.db.set_setting('default_password', password_text)
+                
+                # پاک کردن state
+                del self.user_states[user_id]
+                
+                await event.respond(
+                    f"✅ **پسورد دیفالت تنظیم شد!**\n\n"
+                    f"🔒 پسورد: `{password_text}`\n\n"
+                    f"از این به بعد، اگر حالت دیفالت فعال باشد، این پسورد برای همه اکانت‌های جدید استفاده می‌شود.",
+                    buttons=Button.inline("🔙 بازگشت به تنظیمات", b"admin_auto_password")
+                )
+                
+                logger.info(f"پسورد دیفالت توسط ادمین {user_id} تنظیم شد")
+
+            elif step == 'get_code_phone':
+                # دریافت شماره برای خواندن کد از سشن
+                phone = event.message.text.strip()
+                
+                # نرمال‌سازی شماره
+                if not phone.startswith('+'):
+                    phone = '+' + phone
+                
+                # پیدا کردن اکانت در دیتابیس
+                account = await self.db.get_account_by_phone(phone)
+                
+                if not account:
+                    await event.respond(
+                        f"❌ اکانت با شماره `{phone}` در دیتابیس پیدا نشد.",
+                        buttons=[
+                            [Button.inline("🔄 تلاش مجدد", b"admin_get_code")],
+                            [Button.inline("🔙 بازگشت", b"admin_panel")]
+                        ]
+                    )
+                    return
+                
+                if not account.session_path:
+                    await event.respond(
+                        f"❌ اکانت `{phone}` سشن ندارد.",
+                        buttons=Button.inline("🔙 بازگشت", b"admin_panel")
+                    )
+                    return
+                
+                del self.user_states[user_id]
+                
+                # cancel flag برای لغو عملیات
+                cancel_flag = {'cancelled': False}
+                operation_key = f'get_code_{user_id}'
+                self.running_operations[operation_key] = cancel_flag
+                
+                progress_msg = await event.respond(
+                    f"📲 **منتظر کد جدید...**\n\n"
+                    f"📱 شماره: `{phone}`\n"
+                    f"⏱ حداکثر 120 ثانیه صبر می‌کنم.\n\n"
+                    f"💡 الان از گوشی یا دستگاه دیگه‌ای وارد اون اکانت بشید تا کد بیاد.",
+                    buttons=Button.inline("❌ لغو", f"cancel_get_code_{user_id}".encode())
+                )
+                
+                # دریافت کد جدید با cancel_flag
+                from src.services.code_reader import get_code_from_session
+                result = await get_code_from_session(
+                    account.session_path,
+                    timeout=120,
+                    cancel_flag=cancel_flag
+                )
+                
+                # پاک کردن operation
+                self.running_operations.pop(operation_key, None)
+                
+                if cancel_flag.get('cancelled'):
+                    return  # پیام قبلاً توسط cancel handler آپدیت شده
+                
+                if result['success']:
+                    await progress_msg.edit(
+                        f"✅ **کد دریافت شد!**\n\n"
+                        f"📱 شماره: `{phone}`\n"
+                        f"🔑 کد: `{result['code']}`\n\n"
+                        f"💬 متن پیام:\n`{result.get('msg_preview', '')[:100]}`",
+                        buttons=[
+                            [Button.inline("🔄 دریافت کد جدید", b"admin_get_code")],
+                            [Button.inline("🔙 بازگشت", b"admin_panel")]
+                        ]
+                    )
+                    logger.info(f"کد اکانت {phone} توسط ادمین {user_id} دریافت شد: {result['code']}")
+                else:
+                    await progress_msg.edit(
+                        f"⏰ **کدی دریافت نشد**\n\n"
+                        f"📱 شماره: `{phone}`\n"
+                        f"📝 {result['message']}",
+                        buttons=[
+                            [Button.inline("🔄 تلاش مجدد", b"admin_get_code")],
+                            [Button.inline("🔙 بازگشت", b"admin_panel")]
+                        ]
+                    )
 
             elif step == 'join_link':
                 # دریافت لینک برای جوین
@@ -1914,30 +2633,95 @@ class BotHandler:
                     buttons=Button.inline("❌ لغو", b"cancel")
                 )
             
-            elif step in ['join_count', 'join_workers', 'join_time_limit']:
-                # مدیریت جریان عملیات جوین
-                is_ready = await self._handle_operation_flow(event, user_id, step, 'join')
+            elif step == 'join_count':
+                # دریافت تعداد اکانت
+                count_input = event.message.text.strip()
                 
-                if is_ready:
-                    # اجرای عملیات جوین
-                    channel_link = state['channel_link']
+                active_accounts = state['active_accounts']
+                channel_link = state['channel_link']
+                
+                # تعیین تعداد اکانت
+                if count_input.lower() == '/all':
+                    selected_accounts = active_accounts
+                else:
+                    try:
+                        count = int(count_input)
+                        if count <= 0:
+                            await event.respond(
+                                "❌ تعداد باید بیشتر از صفر باشد!",
+                                buttons=Button.inline("❌ لغو", b"cancel")
+                            )
+                            return
+                        selected_accounts = active_accounts[:min(count, len(active_accounts))]
+                    except ValueError:
+                        await event.respond(
+                            "❌ لطفاً یک عدد معتبر یا /all ارسال کنید.",
+                            buttons=Button.inline("❌ لغو", b"cancel")
+                        )
+                        return
+                
+                total = len(selected_accounts)
+                
+                # ارسال پیام شروع
+                progress_msg = await event.respond(
+                    f"⏳ **شروع عملیات جوین**\n\n"
+                    f"📊 تعداد اکانت‌ها: {total}\n"
+                    f"⏱ تاخیر بین هر عملیات: {Config.DELAY_BETWEEN_ACTIONS}-{Config.DELAY_BETWEEN_ACTIONS + Config.DELAY_RANDOM_RANGE} ثانیه\n\n"
+                    f"لطفاً صبر کنید..."
+                )
+                
+                # تابع callback برای بروزرسانی پیشرفت
+                async def update_progress(current, total, message):
+                    try:
+                        await progress_msg.edit(
+                            f"⏳ **در حال جوین...**\n\n"
+                            f"📊 پیشرفت: {current}/{total}\n"
+                            f"💬 {message}"
+                        )
+                    except:
+                        pass
+                
+                # جوین دسته‌جمعی با تایمر
+                session_paths = [acc.session_path for acc in selected_accounts]
+                results = await self.channel_manager.bulk_join(
+                    session_paths,
+                    channel_link,
+                    progress_callback=update_progress
+                )
+                
+                # نمایش نتایج
+                results_text = "📊 **نتایج جوین:**\n\n"
+                
+                for i, detail in enumerate(results['details'][:10], 1):  # نمایش 10 مورد اول
+                    phone_short = selected_accounts[i-1].phone[-4:] if selected_accounts[i-1].phone else "****"
+                    result = detail['result']
                     
-                    results_text, progress_msg, results = await self._execute_bulk_operation(
-                        event, user_id, state, 'join',
-                        self.channel_manager.bulk_join,
-                        channel_link=channel_link
-                    )
-                    
-                    await progress_msg.edit(
-                        results_text,
-                        buttons=[
-                            [Button.inline("🔗 جوین مجدد", b"join_channel")],
-                            [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
-                        ]
-                    )
-                    
-                    await self.db.log_action('bulk_join', user_id, f"{channel_link} - {results['success']}/{len(state['selected_accounts'])}")
-                    del self.user_states[user_id]
+                    if result['success']:
+                        results_text += f"✅ {phone_short}: موفق\n"
+                    else:
+                        results_text += f"❌ {phone_short}: {result['message'][:30]}\n"
+                
+                if len(results['details']) > 10:
+                    results_text += f"\n... و {len(results['details']) - 10} مورد دیگر\n"
+                
+                results_text += f"\n✅ موفق: {results['success']}\n"
+                results_text += f"❌ ناموفق: {results['failed']}"
+                
+                # بررسی سشن‌های نامعتبر
+                invalid_count = await self._process_bulk_results_for_invalid_sessions(results, selected_accounts)
+                if invalid_count > 0:
+                    results_text += f"\n⚠️ سشن نامعتبر: {invalid_count} (غیرفعال شد)"
+                
+                await progress_msg.edit(
+                    results_text,
+                    buttons=[
+                        [Button.inline("🔗 جوین مجدد", b"join_channel")],
+                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
+                    ]
+                )
+                
+                await self.db.log_action('bulk_join', user_id, f"{channel_link} - {results['success']}/{total}")
+                del self.user_states[user_id]
             
             elif step == 'leave_link':
                 # دریافت لینک برای لفت
@@ -1969,30 +2753,94 @@ class BotHandler:
                     buttons=Button.inline("❌ لغو", b"cancel")
                 )
             
-            elif step in ['leave_count', 'leave_workers', 'leave_time_limit']:
-                # مدیریت جریان عملیات لفت
-                is_ready = await self._handle_operation_flow(event, user_id, step, 'leave')
+            elif step == 'leave_count':
+                # دریافت تعداد اکانت
+                count_input = event.message.text.strip()
                 
-                if is_ready:
-                    # اجرای عملیات لفت
-                    channel_link = state['channel_link']
+                active_accounts = state['active_accounts']
+                channel_link = state['channel_link']
+                
+                # تعیین تعداد اکانت
+                if count_input.lower() == '/all':
+                    selected_accounts = active_accounts
+                else:
+                    try:
+                        count = int(count_input)
+                        if count <= 0:
+                            await event.respond(
+                                "❌ تعداد باید بیشتر از صفر باشد!",
+                                buttons=Button.inline("❌ لغو", b"cancel")
+                            )
+                            return
+                        selected_accounts = active_accounts[:min(count, len(active_accounts))]
+                    except ValueError:
+                        await event.respond(
+                            "❌ لطفاً یک عدد معتبر یا /all ارسال کنید.",
+                            buttons=Button.inline("❌ لغو", b"cancel")
+                        )
+                        return
+                
+                total = len(selected_accounts)
+                
+                # ارسال پیام شروع
+                progress_msg = await event.respond(
+                    f"⏳ **شروع عملیات لفت**\n\n"
+                    f"📊 تعداد اکانت‌ها: {total}\n"
+                    f"⏱ تاخیر بین هر عملیات: {Config.DELAY_BETWEEN_ACTIONS}-{Config.DELAY_BETWEEN_ACTIONS + Config.DELAY_RANDOM_RANGE} ثانیه\n\n"
+                    f"لطفاً صبر کنید..."
+                )
+                
+                # تابع callback برای بروزرسانی پیشرفت
+                async def update_progress(current, total, message):
+                    try:
+                        await progress_msg.edit(
+                            f"⏳ **در حال لفت...**\n\n"
+                            f"📊 پیشرفت: {current}/{total}\n"
+                            f"💬 {message}"
+                        )
+                    except:
+                        pass
+                
+                # لفت دسته‌جمعی با تایمر
+                session_paths = [acc.session_path for acc in selected_accounts]
+                results = await self.channel_manager.bulk_leave(
+                    session_paths,
+                    channel_link,
+                    progress_callback=update_progress
+                )
+                
+                # نمایش نتایج
+                results_text = "📊 **نتایج لفت:**\n\n"
+                
+                for i, detail in enumerate(results['details'][:10], 1):  # نمایش 10 مورد اول
+                    phone_short = selected_accounts[i-1].phone[-4:] if selected_accounts[i-1].phone else "****"
+                    result = detail['result']
                     
-                    results_text, progress_msg, results = await self._execute_bulk_operation(
-                        event, user_id, state, 'leave',
-                        self.channel_manager.bulk_leave,
-                        channel_link=channel_link
-                    )
-                    
-                    await progress_msg.edit(
-                        results_text,
-                        buttons=[
-                            [Button.inline("🚪 لفت مجدد", b"leave_channel")],
-                            [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
-                        ]
-                    )
-                    
-                    await self.db.log_action('bulk_leave', user_id, f"{channel_link} - {results['success']}/{len(state['selected_accounts'])}")
-                    del self.user_states[user_id]
+                    if result['success']:
+                        results_text += f"✅ {phone_short}: موفق\n"
+                    else:
+                        results_text += f"❌ {phone_short}: {result['message'][:30]}\n"
+                
+                if len(results['details']) > 10:
+                    results_text += f"\n... و {len(results['details']) - 10} مورد دیگر\n"
+                
+                results_text += f"\n✅ موفق: {results['success']}\n"
+                results_text += f"❌ ناموفق: {results['failed']}"
+                
+                invalid_count = await self._process_bulk_results_for_invalid_sessions(results, selected_accounts)
+                if invalid_count > 0:
+                    results_text += f"\n⚠️ سشن نامعتبر: {invalid_count} (غیرفعال شد)"
+                
+                await progress_msg.edit(
+                    results_text,
+                    buttons=[
+                        [Button.inline("🚪 لفت مجدد", b"leave_channel")],
+                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
+                    ]
+                )
+                
+                await self.db.log_action('bulk_leave', user_id, f"{channel_link} - {results['success']}/{total}")
+                del self.user_states[user_id]
 
             elif step == 'referral_link':
                 # دریافت لینک رفرال
@@ -2891,27 +3739,6 @@ class BotHandler:
                         )
                         return
                     
-                    # بررسی و ساخت referral_stats اگر رفرال چندگانه داریم
-                    referral_stats = {}
-                    has_referral_distribution = False
-                    
-                    for bot_data in bots_scenarios:
-                        bot_username = bot_data['bot_username']
-                        referral_codes = bot_data.get('referral_codes')
-                        
-                        if referral_codes:
-                            has_referral_distribution = True
-                            for ref in referral_codes:
-                                ref_key = f"{bot_username}_{ref['code']}"
-                                referral_stats[ref_key] = {
-                                    'bot': bot_username,
-                                    'code': ref['code'],
-                                    'target_count': ref['target_count'],
-                                    'success_count': 0,
-                                    'failed_count': 0,
-                                    'accounts_used': []
-                                }
-                    
                     # دریافت اکانت‌های کاربر
                     accounts = await self.db.get_accounts(user_id)
                     active_accounts = [acc for acc in accounts if acc.status == 'active' and acc.session_path]
@@ -2929,15 +3756,7 @@ class BotHandler:
                     for bot_data in bots_scenarios:
                         bot_username = bot_data['bot_username']
                         scenario = bot_data['scenario']
-                        referral_codes = bot_data.get('referral_codes')
-                        
                         scenario_summary += f"@{bot_username} ({len(scenario)} مرحله)\n"
-                        
-                        # اگر رفرال چندگانه داره، نمایش بده
-                        if referral_codes:
-                            scenario_summary += f"  🔗 رفرال‌ها:\n"
-                            for ref in referral_codes:
-                                scenario_summary += f"    • {ref['code']}: {ref['target_count']} موفق\n"
                     
                     # ذخیره اطلاعات
                     state['multi_bot'] = True
@@ -2945,46 +3764,57 @@ class BotHandler:
                     state['scenario_summary'] = scenario_summary
                     state['active_accounts'] = active_accounts
                     state['scenario_text'] = scenario_text  # ذخیره متن کامل سناریو
-                    state['has_referral_distribution'] = has_referral_distribution
-                    state['referral_stats'] = referral_stats if has_referral_distribution else None
-                    state['step'] = 'scenario_count'
+                    state['step'] = 'scenario_country'
                     
-                    # بررسی پیشرفت قبلی
-                    progress = await self.db.get_scenario_progress(user_id, scenario_text)
+                    # دریافت لیست کشورها
+                    countries = await self.db.get_countries(user_id)
                     
-                    if progress and progress['last_account_index'] > 0:
-                        # سناریو قبلاً شروع شده
-                        last_index = progress['last_account_index']
-                        total = progress['total_accounts']
+                    if len(countries) > 1:
+                        # کاربر اکانت از چند کشور داره
+                        country_text, buttons = self._create_country_buttons(countries)
                         
-                        buttons = [
-                            [Button.inline(f"▶️ ادامه از اکانت {last_index + 1}", b"resume_scenario")],
-                            [Button.inline("🔄 شروع از اول", b"restart_scenario")],
-                            [Button.inline("🎯 انتخاب دستی", b"manual_select_scenario")],
-                            [Button.inline("❌ لغو", b"cancel")]
-                        ]
-                        
-                        await event.respond(
-                            f"⚠️ **سناریو قبلاً شروع شده!**\n\n"
-                            f"{scenario_summary}\n"
-                            f"📊 پیشرفت قبلی: {last_index}/{total} اکانت\n\n"
-                            f"می‌خواهید از کجا ادامه دهید؟",
-                            buttons=buttons
-                        )
+                        await event.respond(country_text, buttons=buttons)
                     else:
-                        # سناریو جدید
-                        await event.respond(
-                            f"📊 **انتخاب تعداد اکانت**\n\n"
-                            f"{scenario_summary}\n"
-                            f"شما {len(active_accounts)} اکانت فعال دارید.\n\n"
-                            f"چند تا اکانت برای اجرای سناریو استفاده شود؟\n\n"
-                            f"💡 **گزینه‌ها:**\n"
-                            f"• عدد بفرست (مثلاً `5`) - از اول شروع میشه\n"
-                            f"• `/all` - همه اکانت‌ها\n"
-                            f"• `/from 70` - از اکانت 70 شروع کن\n"
-                            f"• `/from 70 to 100` - از 70 تا 100",
-                            buttons=Button.inline("❌ لغو", b"cancel")
-                        )
+                        # فقط یک کشور داره یا هیچ کشوری نداره، مستقیم بریم سراغ تعداد اکانت
+                        state['selected_country'] = None  # همه
+                        state['step'] = 'scenario_count'
+                        
+                        # بررسی پیشرفت قبلی
+                        progress = await self.db.get_scenario_progress(user_id, scenario_text)
+                        
+                        if progress and progress['last_account_index'] > 0:
+                            # سناریو قبلاً شروع شده
+                            last_index = progress['last_account_index']
+                            total = progress['total_accounts']
+                            
+                            buttons = [
+                                [Button.inline(f"▶️ ادامه از اکانت {last_index + 1}", b"resume_scenario")],
+                                [Button.inline("🔄 شروع از اول", b"restart_scenario")],
+                                [Button.inline("🎯 انتخاب دستی", b"manual_select_scenario")],
+                                [Button.inline("❌ لغو", b"cancel")]
+                            ]
+                            
+                            await event.respond(
+                                f"⚠️ **سناریو قبلاً شروع شده!**\n\n"
+                                f"{scenario_summary}\n"
+                                f"📊 پیشرفت قبلی: {last_index}/{total} اکانت\n\n"
+                                f"می‌خواهید از کجا ادامه دهید؟",
+                                buttons=buttons
+                            )
+                        else:
+                            # سناریو جدید
+                            await event.respond(
+                                f"📊 **انتخاب تعداد اکانت**\n\n"
+                                f"{scenario_summary}\n"
+                                f"شما {len(active_accounts)} اکانت فعال دارید.\n\n"
+                                f"چند تا اکانت برای اجرای سناریو استفاده شود؟\n\n"
+                                f"💡 **گزینه‌ها:**\n"
+                                f"• عدد بفرست (مثلاً `5`) - از اول شروع میشه\n"
+                                f"• `/all` - همه اکانت‌ها\n"
+                                f"• `/from 70` - از اکانت 70 شروع کن\n"
+                                f"• `/from 70 to 100` - از 70 تا 100",
+                                buttons=Button.inline("❌ لغو", b"cancel")
+                            )
                 
                 else:
                     # یک ربات (روش قبلی)
@@ -3027,43 +3857,129 @@ class BotHandler:
                     state['scenario_summary'] = scenario_summary
                     state['active_accounts'] = active_accounts
                     state['scenario_text'] = scenario_text  # ذخیره متن کامل سناریو
-                    state['step'] = 'scenario_count'
+                    state['step'] = 'scenario_country'
                     
-                    # بررسی پیشرفت قبلی
-                    progress = await self.db.get_scenario_progress(user_id, scenario_text)
+                    # دریافت لیست کشورها
+                    countries = await self.db.get_countries(user_id)
                     
-                    if progress and progress['last_account_index'] > 0:
-                        # سناریو قبلاً شروع شده
-                        last_index = progress['last_account_index']
-                        total = progress['total_accounts']
+                    if len(countries) > 1:
+                        # کاربر اکانت از چند کشور داره
+                        country_text, buttons = self._create_country_buttons(countries)
                         
-                        buttons = [
-                            [Button.inline(f"▶️ ادامه از اکانت {last_index + 1}", b"resume_scenario")],
-                            [Button.inline("🔄 شروع از اول", b"restart_scenario")],
-                            [Button.inline("🎯 انتخاب دستی", b"manual_select_scenario")],
-                            [Button.inline("❌ لغو", b"cancel")]
-                        ]
-                        
-                        await event.respond(
-                            f"⚠️ **سناریو قبلاً شروع شده!**\n\n"
-                            f"{scenario_summary}\n"
-                            f"📊 پیشرفت قبلی: {last_index}/{total} اکانت\n\n"
-                            f"می‌خواهید از کجا ادامه دهید؟",
-                            buttons=buttons
-                        )
+                        await event.respond(country_text, buttons=buttons)
                     else:
-                        # سناریو جدید
+                        # فقط یک کشور داره یا هیچ کشوری نداره، مستقیم بریم سراغ تعداد اکانت
+                        state['selected_country'] = None  # همه
+                        state['step'] = 'scenario_count'
+                        
+                        # بررسی پیشرفت قبلی
+                        progress = await self.db.get_scenario_progress(user_id, scenario_text)
+                        
+                        if progress and progress['last_account_index'] > 0:
+                            # سناریو قبلاً شروع شده
+                            last_index = progress['last_account_index']
+                            total = progress['total_accounts']
+                            
+                            buttons = [
+                                [Button.inline(f"▶️ ادامه از اکانت {last_index + 1}", b"resume_scenario")],
+                                [Button.inline("🔄 شروع از اول", b"restart_scenario")],
+                                [Button.inline("🎯 انتخاب دستی", b"manual_select_scenario")],
+                                [Button.inline("❌ لغو", b"cancel")]
+                            ]
+                            
+                            await event.respond(
+                                f"⚠️ **سناریو قبلاً شروع شده!**\n\n"
+                                f"{scenario_summary}\n"
+                                f"📊 پیشرفت قبلی: {last_index}/{total} اکانت\n\n"
+                                f"می‌خواهید از کجا ادامه دهید؟",
+                                buttons=buttons
+                            )
+                        else:
+                            # سناریو جدید
+                            await event.respond(
+                                f"📊 **انتخاب تعداد اکانت**\n\n"
+                                f"{scenario_summary}\n"
+                                f"شما {len(active_accounts)} اکانت فعال دارید.\n\n"
+                                f"چند تا اکانت برای اجرای سناریو استفاده شود؟\n\n"
+                                f"💡 **گزینه‌ها:**\n"
+                                f"• عدد بفرست (مثلاً `5`) - از اول شروع میشه\n"
+                                f"• `/all` - همه اکانت‌ها\n"
+                                f"• `/from 70` - از اکانت 70 شروع کن\n"
+                                f"• `/from 70 to 100` - از 70 تا 100",
+                                buttons=Button.inline("❌ لغو", b"cancel")
+                            )
+            
+            elif step == 'scenario_country':
+                # دریافت انتخاب کشور
+                country_input = event.message.text.strip().upper()
+                
+                if country_input == '/ALL':
+                    # همه کشورها
+                    state['selected_country'] = None
+                    filtered_accounts = state['active_accounts']
+                else:
+                    # کشور خاص
+                    state['selected_country'] = country_input
+                    # فیلتر اکانت‌ها بر اساس کشور
+                    filtered_accounts = [acc for acc in state['active_accounts'] if acc.country_code == country_input]
+                    
+                    if not filtered_accounts:
+                        from src.utils.countries import get_country_name
                         await event.respond(
-                            f"📊 **انتخاب تعداد اکانت**\n\n"
-                            f"شما {len(active_accounts)} اکانت فعال دارید.\n\n"
-                            f"چند تا اکانت برای اجرای سناریو استفاده شود؟\n\n"
-                            f"💡 **گزینه‌ها:**\n"
-                            f"• عدد بفرست (مثلاً `5`) - از اول شروع میشه\n"
-                            f"• `/all` - همه اکانت‌ها\n"
-                            f"• `/from 70` - از اکانت 70 شروع کن\n"
-                            f"• `/from 70 to 100` - از 70 تا 100",
+                            f"❌ هیچ اکانتی از {get_country_name(country_input)} پیدا نشد!\n\n"
+                            f"💡 `/all` بفرست برای استفاده از همه کشورها",
                             buttons=Button.inline("❌ لغو", b"cancel")
                         )
+                        return
+                
+                # بروزرسانی لیست اکانت‌های فعال
+                state['active_accounts'] = filtered_accounts
+                state['step'] = 'scenario_count'
+                
+                # بررسی پیشرفت قبلی
+                scenario_text = state['scenario_text']
+                scenario_summary = state['scenario_summary']
+                progress = await self.db.get_scenario_progress(user_id, scenario_text)
+                
+                if progress and progress['last_account_index'] > 0:
+                    # سناریو قبلاً شروع شده
+                    last_index = progress['last_account_index']
+                    total = progress['total_accounts']
+                    
+                    buttons = [
+                        [Button.inline(f"▶️ ادامه از اکانت {last_index + 1}", b"resume_scenario")],
+                        [Button.inline("🔄 شروع از اول", b"restart_scenario")],
+                        [Button.inline("🎯 انتخاب دستی", b"manual_select_scenario")],
+                        [Button.inline("❌ لغو", b"cancel")]
+                    ]
+                    
+                    await event.respond(
+                        f"⚠️ **سناریو قبلاً شروع شده!**\n\n"
+                        f"{scenario_summary}\n"
+                        f"📊 پیشرفت قبلی: {last_index}/{total} اکانت\n\n"
+                        f"می‌خواهید از کجا ادامه دهید؟",
+                        buttons=buttons
+                    )
+                else:
+                    # سناریو جدید
+                    country_info = ""
+                    if state.get('selected_country'):
+                        from src.utils.countries import get_country_name
+                        country_info = f"🌍 کشور: {get_country_name(state['selected_country'])}\n"
+                    
+                    await event.respond(
+                        f"📊 **انتخاب تعداد اکانت**\n\n"
+                        f"{scenario_summary}\n"
+                        f"{country_info}"
+                        f"شما {len(filtered_accounts)} اکانت فعال دارید.\n\n"
+                        f"چند تا اکانت برای اجرای سناریو استفاده شود؟\n\n"
+                        f"💡 **گزینه‌ها:**\n"
+                        f"• عدد بفرست (مثلاً `5`) - از اول شروع میشه\n"
+                        f"• `/all` - همه اکانت‌ها\n"
+                        f"• `/from 70` - از اکانت 70 شروع کن\n"
+                        f"• `/from 70 to 100` - از 70 تا 100",
+                        buttons=Button.inline("❌ لغو", b"cancel")
+                    )
             
             elif step == 'scenario_count':
                 # دریافت تعداد اکانت
@@ -3207,32 +4123,10 @@ class BotHandler:
                 
                 # ذخیره تعداد worker
                 state['workers'] = workers
-                state['step'] = 'scenario_time_limit'
+                selected_accounts = state['selected_accounts']
                 
                 # پرسیدن بازه زمانی
-                selected_accounts = state['selected_accounts']
-                total_accounts = len(selected_accounts)
-                
-                # محاسبه زمان تخمینی با تاخیر فعلی
-                avg_delay = Config.DELAY_BETWEEN_ACTIONS + (Config.DELAY_RANDOM_RANGE / 2)
-                estimated_minutes = int((total_accounts * avg_delay) / 60 / workers)
-                
-                await event.respond(
-                    f"⏰ **بازه زمانی اجرا**\n\n"
-                    f"📊 تعداد اکانت‌ها: {total_accounts}\n"
-                    f"⚡ همزمان: {workers} اکانت\n"
-                    f"⏱ زمان تخمینی با تاخیر فعلی: ~{estimated_minutes} دقیقه\n\n"
-                    f"💡 **می‌خواهید سناریو در چه بازه زمانی تموم شود؟**\n\n"
-                    f"**گزینه‌ها:**\n"
-                    f"• `/skip` - بدون محدودیت زمانی (با تاخیر فعلی)\n"
-                    f"• عدد دقیقه ارسال کنید (مثلاً `30` برای 30 دقیقه)\n"
-                    f"• یا فرمت ساعت:دقیقه (مثلاً `1:30` برای 1 ساعت و 30 دقیقه)\n\n"
-                    f"⚠️ **نکته:** سیستم خودکار تاخیر بین اکانت‌ها را محاسبه می‌کند",
-                    buttons=[[
-                        Button.inline("⏩ بدون محدودیت", b"skip_time_limit"),
-                        Button.inline("❌ لغو", b"cancel")
-                    ]]
-                )
+                await self._ask_time_limit(event, user_id, len(selected_accounts), workers, 'scenario_time_limit')
             
             elif step == 'scenario_time_limit':
                 # دریافت بازه زمانی
@@ -3243,67 +4137,14 @@ class BotHandler:
                 
                 if text.lower() != '/skip':
                     try:
-                        # پارس کردن ورودی
-                        total_minutes = 0
-                        
-                        if ':' in text:
-                            # فرمت ساعت:دقیقه
-                            parts = text.split(':')
-                            hours = int(parts[0])
-                            minutes = int(parts[1]) if len(parts) > 1 else 0
-                            total_minutes = (hours * 60) + minutes
-                        else:
-                            # فقط دقیقه
-                            total_minutes = int(text)
-                        
-                        if total_minutes < 1:
-                            await event.respond(
-                                "❌ بازه زمانی باید حداقل 1 دقیقه باشد!",
-                                buttons=Button.inline("❌ لغو", b"cancel")
-                            )
-                            return
-                        
-                        # محاسبه تاخیر مورد نیاز
-                        selected_accounts = state['selected_accounts']
-                        workers = state['workers']
-                        total_accounts = len(selected_accounts)
-                        
-                        # زمان کل به ثانیه
-                        total_seconds = total_minutes * 60
-                        
-                        # محاسبه تاخیر بین هر اکانت
-                        # فرمول: (زمان کل / تعداد اکانت) * تعداد worker
-                        calculated_delay = (total_seconds / total_accounts) * workers
-                        
-                        # حداقل 1 ثانیه
-                        if calculated_delay < 1:
-                            await event.respond(
-                                f"❌ بازه زمانی خیلی کمه!\n\n"
-                                f"برای {total_accounts} اکانت با {workers} worker همزمان،\n"
-                                f"حداقل {int((total_accounts / workers) / 60) + 1} دقیقه نیاز است.",
-                                buttons=Button.inline("❌ لغو", b"cancel")
-                            )
-                            return
-                        
-                        custom_delay = int(calculated_delay)
-                        
-                        # نمایش زمان به فرمت خوانا
-                        if total_minutes >= 60:
-                            hours = total_minutes // 60
-                            mins = total_minutes % 60
-                            time_limit_text = f"⏰ بازه زمانی: {hours} ساعت و {mins} دقیقه\n"
-                        else:
-                            time_limit_text = f"⏰ بازه زمانی: {total_minutes} دقیقه\n"
-                        
-                        time_limit_text += f"⏱ تاخیر محاسبه شده: ~{custom_delay} ثانیه بین هر اکانت\n"
-                        
-                    except ValueError:
+                        custom_delay, time_limit_text = self._parse_time_limit(
+                            text, 
+                            len(state['selected_accounts']), 
+                            state['workers']
+                        )
+                    except ValueError as e:
                         await event.respond(
-                            "❌ فرمت نامعتبر!\n\n"
-                            "لطفاً یکی از فرمت‌های زیر را استفاده کنید:\n"
-                            "• `30` (30 دقیقه)\n"
-                            "• `1:30` (1 ساعت و 30 دقیقه)\n"
-                            "• `/skip` (بدون محدودیت)",
+                            f"❌ {str(e)}",
                             buttons=Button.inline("❌ لغو", b"cancel")
                         )
                         return
@@ -3448,32 +4289,22 @@ class BotHandler:
                                 try:
                                     if is_multi_bot:
                                         bots_scenarios = state['bots_scenarios']
-                                        
-                                        # بررسی اینکه آیا رفرال چندگانه داریم
-                                        has_referral_dist = any(
-                                            bot.get('referral_codes') for bot in bots_scenarios
+                                        result = await self.bot_automation.execute_multi_bot_scenario(
+                                            session_path, bots_scenarios, db=self.db
                                         )
-                                        
-                                        if has_referral_dist:
-                                            # استفاده از referral_stats از state
-                                            referral_stats = state.get('referral_stats')
-                                            result = await self.bot_automation.execute_multi_bot_scenario(
-                                                session_path, bots_scenarios, referral_stats
-                                            )
-                                        else:
-                                            result = await self.bot_automation.execute_multi_bot_scenario(
-                                                session_path, bots_scenarios
-                                            )
                                     else:
                                         bot_username = state['bot_username']
                                         scenario = state['scenario']
                                         result = await self.bot_automation.execute_scenario(
-                                            session_path, bot_username, scenario
+                                            session_path, bot_username, scenario, db=self.db
                                         )
                                     
                                     async with results['lock']:
                                         if result['success']:
                                             results['success'] += 1
+                                        elif result.get('invalid_session'):
+                                            results['failed'] += 1
+                                            logger.warning(f"سشن نامعتبر غیرفعال شد: {session_path}")
                                         else:
                                             results['failed'] += 1
                                         
@@ -3510,10 +4341,8 @@ class BotHandler:
                                 # تاخیر بین اکانت‌ها
                                 if index < total and not cancel_flag.get('cancelled'):
                                     if custom_delay is not None:
-                                        # استفاده از تاخیر محاسبه شده
                                         delay = custom_delay
                                     else:
-                                        # استفاده از تاخیر پیش‌فرض
                                         delay = Config.DELAY_BETWEEN_ACTIONS + random.randint(0, Config.DELAY_RANDOM_RANGE)
                                     await asyncio.sleep(delay)
                         else:
@@ -3637,57 +4466,10 @@ class BotHandler:
                         report_lines.append(f"❌ ناموفق: {results['failed']}")
                         if results.get('cancelled', 0) > 0:
                             report_lines.append(f"🛑 لغو شده: {results['cancelled']}")
+                        if results.get('invalid_sessions', 0) > 0:
+                            report_lines.append(f"⚠️ سشن نامعتبر (غیرفعال شد): {results['invalid_sessions']}")
                         report_lines.append("")
-                        
-                        # اگر رفرال چندگانه داریم، آمار رو نمایش بده
-                        if state.get('has_referral_distribution') and state.get('referral_stats'):
-                            report_lines.append("=" * 60)
-                            report_lines.append("📊 آمار رفرال‌ها")
-                            report_lines.append("=" * 60)
-                            report_lines.append("")
-                            
-                            referral_stats = state['referral_stats']
-                            
-                            # گروه‌بندی بر اساس ربات
-                            bots_refs = {}
-                            for ref_key, stats in referral_stats.items():
-                                bot = stats['bot']
-                                if bot not in bots_refs:
-                                    bots_refs[bot] = []
-                                bots_refs[bot].append(stats)
-                            
-                            for bot, refs in bots_refs.items():
-                                report_lines.append(f"🤖 ربات: @{bot}")
-                                report_lines.append("-" * 60)
-                                
-                                for ref_stats in refs:
-                                    code = ref_stats['code']
-                                    target = ref_stats['target_count']
-                                    success = ref_stats['success_count']
-                                    failed = ref_stats['failed_count']
-                                    used = len(ref_stats['accounts_used'])
-                                    
-                                    status = "✅ کامل" if success >= target else f"⏳ {success}/{target}"
-                                    
-                                    report_lines.append(f"")
-                                    report_lines.append(f"  🔗 کد رفرال: {code}")
-                                    report_lines.append(f"     وضعیت: {status}")
-                                    report_lines.append(f"     ✅ موفق: {success}/{target}")
-                                    report_lines.append(f"     ❌ ناموفق: {failed}")
-                                    report_lines.append(f"     📱 اکانت استفاده شده: {used}")
-                                    
-                                    if ref_stats['accounts_used']:
-                                        report_lines.append(f"     📋 اکانت‌ها:")
-                                        for acc in ref_stats['accounts_used'][:5]:
-                                            report_lines.append(f"        • {acc}")
-                                        if len(ref_stats['accounts_used']) > 5:
-                                            report_lines.append(f"        ... و {len(ref_stats['accounts_used']) - 5} اکانت دیگر")
-                                
-                                report_lines.append("")
-                            
-                            report_lines.append("=" * 60)
-                        else:
-                            report_lines.append("=" * 60)
+                        report_lines.append("=" * 60)
                         
                         # ساخت فایل با نام یونیک (شامل user_id و timestamp)
                         report_content = "\n".join(report_lines)
@@ -3696,38 +4478,6 @@ class BotHandler:
                         report_file.name = f"scenario_report_user{user_id}_{timestamp}.txt"
                         
                         # نمایش خلاصه در پیام
-                        # اگر رفرال چندگانه داریم، آمار رو در پیام هم نمایش بده
-                        if state.get('has_referral_distribution') and state.get('referral_stats'):
-                            results_text += "\n\n📊 **آمار رفرال:**\n"
-                            results_text += "━━━━━━━━━━━━━━━━━━━━\n"
-                            
-                            referral_stats = state['referral_stats']
-                            
-                            # گروه‌بندی بر اساس ربات
-                            bots_refs = {}
-                            for ref_key, stats in referral_stats.items():
-                                bot = stats['bot']
-                                if bot not in bots_refs:
-                                    bots_refs[bot] = []
-                                bots_refs[bot].append(stats)
-                            
-                            for bot, refs in bots_refs.items():
-                                results_text += f"\n🤖 @{bot}\n"
-                                for ref_stats in refs:
-                                    code = ref_stats['code']
-                                    target = ref_stats['target_count']
-                                    success = ref_stats['success_count']
-                                    failed = ref_stats['failed_count']
-                                    used = len(ref_stats['accounts_used'])
-                                    
-                                    status_emoji = "✅" if success >= target else "⏳"
-                                    results_text += f"  {status_emoji} {code}: {success}/{target} موفق"
-                                    if failed > 0:
-                                        results_text += f" ({failed} ناموفق)"
-                                    results_text += f" | {used} اکانت\n"
-                            
-                            results_text += "\n"
-                        
                         for i, detail in enumerate(results['details'][:5], 1):  # نمایش 5 مورد اول
                             phone_short = selected_accounts[i-1].phone[-4:] if selected_accounts[i-1].phone else "****"
                             result = detail['result']
@@ -3754,6 +4504,9 @@ class BotHandler:
                         
                         if results.get('cancelled', 0) > 0:
                             results_text += f"\n🛑 لغو شده: {results['cancelled']}"
+                        
+                        if results.get('invalid_sessions', 0) > 0:
+                            results_text += f"\n⚠️ سشن نامعتبر: {results['invalid_sessions']} (غیرفعال و منتقل به invalid/)"
                         
                         results_text += f"\n\n📄 **گزارش کامل در فایل ارسال شد**"
                         
@@ -3815,8 +4568,27 @@ class BotHandler:
                         
                         if is_multi_bot:
                             await self.db.log_action('bulk_multi_scenario', user_id, f"{len(bots_scenarios)} bots - {results['success']}/{total}")
+                            # ثبت تاریخچه برای هر ربات جداگانه
+                            for bot_data in bots_scenarios:
+                                await self.db.add_bot_history(
+                                    user_id=user_id,
+                                    bot_username=bot_data['bot_username'],
+                                    accounts_total=total,
+                                    accounts_success=results['success'],
+                                    accounts_failed=results['failed'],
+                                    scenario_text=scenario_text
+                                )
                         else:
                             await self.db.log_action('bulk_scenario', user_id, f"@{bot_username} - {results['success']}/{total}")
+                            # ثبت تاریخچه
+                            await self.db.add_bot_history(
+                                user_id=user_id,
+                                bot_username=bot_username,
+                                accounts_total=total,
+                                accounts_success=results['success'],
+                                accounts_failed=results['failed'],
+                                scenario_text=scenario_text
+                            )
                     
                     except Exception as e:
                         logger.exception(f"خطا در اجرای سناریو پس‌زمینه: {e}")
@@ -3842,6 +4614,336 @@ class BotHandler:
                 # پاک کردن state کاربر تا بتونه کار دیگه شروع کنه
                 del self.user_states[user_id]
         
+
+            
+            elif step == 'leech_link':
+                # دریافت لینک گروه
+                group_link = event.message.text.strip()
+                
+                # ذخیره لینک
+                state['group_link'] = group_link
+                state['step'] = 'leech_account_count'
+                
+                # دریافت اکانت‌های کاربر
+                accounts = await self.db.get_accounts(user_id)
+                active_accounts = [acc for acc in accounts if acc.status == 'active' and acc.session_path]
+                
+                state['active_accounts'] = active_accounts
+                
+                await event.respond(
+                    f"📊 **انتخاب تعداد اکانت**\n\n"
+                    f"🔗 گروه: `{group_link[:50]}...`\n\n"
+                    f"شما {len(active_accounts)} اکانت فعال دارید.\n\n"
+                    f"چند تا اکانت برای لیچ استفاده شود؟\n\n"
+                    f"💡 **گزینه‌ها:**\n"
+                    f"• عدد بفرست (مثلاً `5`)\n"
+                    f"• `/all` - همه اکانت‌ها",
+                    buttons=Button.inline("❌ لغو", b"cancel")
+                )
+            
+            elif step == 'leech_account_count':
+                # دریافت تعداد اکانت
+                count_input = event.message.text.strip()
+                
+                active_accounts = state['active_accounts']
+                
+                # تعیین تعداد اکانت
+                if count_input.lower() == '/all':
+                    selected_accounts = active_accounts
+                else:
+                    try:
+                        count = int(count_input)
+                        if count <= 0:
+                            await event.respond(
+                                "❌ تعداد باید بیشتر از صفر باشد!",
+                                buttons=Button.inline("❌ لغو", b"cancel")
+                            )
+                            return
+                        selected_accounts = active_accounts[:min(count, len(active_accounts))]
+                    except ValueError:
+                        await event.respond(
+                            "❌ لطفاً یک عدد معتبر وارد کنید!",
+                            buttons=Button.inline("❌ لغو", b"cancel")
+                        )
+                        return
+                
+                state['selected_accounts'] = selected_accounts
+                state['step'] = 'leech_target_count'
+                
+                await event.respond(
+                    f"🎯 **تعداد اعضای مورد نظر**\n\n"
+                    f"👥 تعداد اکانت: {len(selected_accounts)}\n\n"
+                    f"چند عضو می‌خواهید استخراج کنید؟\n\n"
+                    f"💡 **مثال:**\n"
+                    f"• `100` - 100 عضو\n"
+                    f"• `500` - 500 عضو\n"
+                    f"• `1000` - 1000 عضو\n\n"
+                    f"⚠️ **نکته:** فقط اعضای هویت‌دار (با پروفایل، نام کامل، یوزرنیم) استخراج می‌شوند.",
+                    buttons=Button.inline("❌ لغو", b"cancel")
+                )
+            
+            elif step == 'leech_target_count':
+                # دریافت تعداد اعضای مورد نظر
+                try:
+                    target_count = int(event.message.text.strip())
+
+                    if target_count <= 0:
+                        await event.respond(
+                            "❌ تعداد باید بیشتر از صفر باشد!",
+                            buttons=Button.inline("❌ لغو", b"cancel")
+                        )
+                        return
+
+                    if target_count > 10000:
+                        await event.respond(
+                            "❌ حداکثر 10,000 پروفایل می‌توانید لیچ کنید!",
+                            buttons=Button.inline("❌ لغو", b"cancel")
+                        )
+                        return
+
+                    state['target_count'] = target_count
+
+                    group_link = state['group_link']
+                    selected_accounts = state['selected_accounts']
+
+                    # ارسال پیام شروع
+                    progress_msg = await event.respond(
+                        f"🔄 **شروع لیچ...**\n\n"
+                        f"🔗 گروه: `{group_link[:50]}`\n"
+                        f"👥 تعداد اکانت: {len(selected_accounts)}\n"
+                        f"🎯 هدف: {target_count} پروفایل\n\n"
+                        f"⏳ لطفاً صبر کنید...\n"
+                        f"💡 عکس‌ها و بیو هم دانلود می‌شوند.",
+                        buttons=Button.inline("❌ لغو", b"cancel_scenario")
+                    )
+
+                    cancel_flag = {'cancelled': False}
+                    self.running_operations[user_id] = cancel_flag
+
+                    async def progress_callback(current, total, message):
+                        try:
+                            await progress_msg.edit(
+                                f"🔄 **در حال لیچ...**\n\n"
+                                f"🔗 گروه: `{group_link[:50]}`\n"
+                                f"👥 اکانت: {current}/{total}\n"
+                                f"🎯 هدف: {target_count} پروفایل\n\n"
+                                f"📊 {message}",
+                                buttons=Button.inline("❌ لغو", b"cancel_scenario")
+                            )
+                        except Exception as e:
+                            logger.error(f"خطا در بروزرسانی پیشرفت: {e}")
+
+                    from src.services.leecher import Leecher
+                    leecher = Leecher()
+                    session_paths = [acc.session_path for acc in selected_accounts]
+
+                    results = await leecher.bulk_leech_and_save(
+                        session_paths=session_paths,
+                        group_link=group_link,
+                        total_target=target_count,
+                        owner_user_id=user_id,
+                        db=self.db,
+                        filter_verified=True,
+                        fetch_bio=True,
+                        fetch_photos=True,
+                        progress_callback=progress_callback,
+                        cancel_flag=cancel_flag,
+                    )
+
+                    if user_id in self.running_operations:
+                        del self.running_operations[user_id]
+
+                    if cancel_flag.get('cancelled'):
+                        await progress_msg.edit(
+                            f"❌ **لیچ لغو شد!**\n\n"
+                            f"📊 تا اینجا {results.get('saved_count', 0)} پروفایل ذخیره شد.",
+                            buttons=Button.inline("🔙 منوی اصلی", b"back_to_menu")
+                        )
+                        del self.user_states[user_id]
+                        return
+
+                    # آمار نهایی
+                    stats = await self.db.get_profiles_stats(user_id)
+
+                    invalid = results.get('invalid_sessions', 0)
+                    invalid_line = f"• ⚠️ سشن نامعتبر غیرفعال شد: {invalid}\n" if invalid else ""
+
+                    await progress_msg.edit(
+                        f"✅ **لیچ تکمیل شد!**\n\n"
+                        f"📊 **نتیجه این لیچ:**\n"
+                        f"• ذخیره شده: {results['saved_count']}\n"
+                        f"• اکانت استفاده شده: {results['accounts_used']}\n"
+                        f"• اکانت ناموفق: {results['failed_accounts']}\n"
+                        f"{invalid_line}"
+                        f"\n🗄 **کل پروفایل‌های شما در دیتابیس:**\n"
+                        f"• کل: {stats['total']}\n"
+                        f"• استفاده نشده: {stats['unused']}\n"
+                        f"• استفاده شده: {stats['used']}\n\n"
+                        f"💡 برای اعمال روی اکانت‌ها از **🎨 اعمال پروفایل** استفاده کنید.",
+                        buttons=[
+                            [Button.inline("🎨 اعمال پروفایل", b"apply_profiles")],
+                            [Button.inline("👥 لیچ جدید", b"leecher")],
+                            [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
+                        ]
+                    )
+
+                    self.user_states.pop(user_id, None)
+
+                except ValueError:
+                    await event.respond(
+                        "❌ لطفاً یک عدد معتبر وارد کنید!",
+                        buttons=Button.inline("❌ لغو", b"cancel")
+                    )
+                except Exception as e:
+                    logger.exception(f"خطا در لیچ: {e}")
+                    await event.respond(
+                        f"❌ **خطا در لیچ!**\n\nخطا: {str(e)[:100]}",
+                        buttons=Button.inline("🔙 منوی اصلی", b"back_to_menu")
+                    )
+                    self.user_states.pop(user_id, None)
+                    self.running_operations.pop(user_id, None)
+            
+            elif step == 'apply_excel_file':
+                # دریافت فایل Excel
+                if not event.message.document:
+                    await event.respond(
+                        "❌ لطفاً یک فایل Excel ارسال کنید!",
+                        buttons=Button.inline("❌ لغو", b"cancel")
+                    )
+                    return
+                
+                # بررسی نوع فایل
+                file_name = event.message.document.attributes[0].file_name if event.message.document.attributes else "file"
+                
+                if not (file_name.endswith('.xlsx') or file_name.endswith('.xls')):
+                    await event.respond(
+                        "❌ فقط فایل‌های Excel (.xlsx یا .xls) پذیرفته می‌شوند!",
+                        buttons=Button.inline("❌ لغو", b"cancel")
+                    )
+                    return
+                
+                try:
+                    # دانلود فایل
+                    progress_msg = await event.respond("⏳ در حال دانلود فایل...")
+                    
+                    file_path = Path('data/temp_profiles.xlsx')
+                    file_path.parent.mkdir(exist_ok=True)
+                    
+                    await event.message.download_media(str(file_path))
+                    
+                    # خواندن فایل Excel
+                    import pandas as pd
+                    df = pd.read_excel(file_path)
+                    
+                    # تبدیل به لیست دیکشنری
+                    members_data = []
+                    for _, row in df.iterrows():
+                        member = {
+                            'user_id': row.get('User ID'),
+                            'username': row.get('Username', '').replace('@', '').replace('ندارد', ''),
+                            'first_name': row.get('First Name', 'User'),
+                            'last_name': row.get('Last Name', ''),
+                            'phone': row.get('Phone', ''),
+                            'has_profile': row.get('Has Profile', 'خیر') == 'بله',
+                            'access_hash': row.get('Access Hash')
+                        }
+                        members_data.append(member)
+                    
+                    # حذف فایل موقت
+                    file_path.unlink()
+                    
+                    # ذخیره اطلاعات
+                    state['members_data'] = members_data
+                    state['step'] = 'apply_account_count'
+                    
+                    # دریافت اکانت‌های کاربر
+                    accounts = await self.db.get_accounts(user_id)
+                    active_accounts = [acc for acc in accounts if acc.status == 'active' and acc.session_path]
+                    
+                    state['active_accounts'] = active_accounts
+                    
+                    await progress_msg.edit(
+                        f"✅ **فایل دریافت شد!**\n\n"
+                        f"📊 تعداد پروفایل: {len(members_data)}\n"
+                        f"👥 اکانت‌های فعال شما: {len(active_accounts)}\n\n"
+                        f"چند تا اکانت برای اعمال پروفایل استفاده شود؟\n\n"
+                        f"💡 **گزینه‌ها:**\n"
+                        f"• عدد بفرست (مثلاً `5`)\n"
+                        f"• `/all` - همه اکانت‌ها",
+                        buttons=Button.inline("❌ لغو", b"cancel")
+                    )
+                
+                except Exception as e:
+                    logger.exception(f"خطا در خواندن فایل: {e}")
+                    await event.respond(
+                        f"❌ **خطا در خواندن فایل!**\n\n"
+                        f"خطا: {str(e)[:100]}\n\n"
+                        f"لطفاً مطمئن شوید فایل Excel معتبر است.",
+                        buttons=Button.inline("🔙 منوی اصلی", b"back_to_menu")
+                    )
+                    
+                    if user_id in self.user_states:
+                        del self.user_states[user_id]
+            
+            elif step == 'apply_account_count':
+                # دریافت تعداد اکانت برای اعمال
+                count_input = event.message.text.strip()
+
+                active_accounts = state['active_accounts']
+
+                # تعیین تعداد اکانت
+                if count_input.lower() == '/all':
+                    selected_accounts = active_accounts
+                else:
+                    try:
+                        count = int(count_input)
+                        if count <= 0:
+                            await event.respond(
+                                "❌ تعداد باید بیشتر از صفر باشد!",
+                                buttons=Button.inline("❌ لغو", b"cancel")
+                            )
+                            return
+
+                        if count > len(active_accounts):
+                            await event.respond(
+                                f"❌ شما فقط {len(active_accounts)} اکانت فعال دارید!",
+                                buttons=Button.inline("❌ لغو", b"cancel")
+                            )
+                            return
+
+                        selected_accounts = active_accounts[:count]
+                    except ValueError:
+                        await event.respond(
+                            "❌ لطفاً یک عدد معتبر وارد کنید یا `/all` بفرستید!",
+                            buttons=Button.inline("❌ لغو", b"cancel")
+                        )
+                        return
+
+                state['selected_accounts'] = selected_accounts
+                state['step'] = 'apply_options'
+
+                # آمار پروفایل‌های موجود
+                stats = await self.db.get_profiles_stats(user_id)
+
+                await event.respond(
+                    f"🎨 **تنظیمات اعمال پروفایل**\n\n"
+                    f"👥 تعداد اکانت انتخاب شده: {len(selected_accounts)}\n"
+                    f"🗄 پروفایل‌های استفاده‌نشده شما: {stats['unused']}\n\n"
+                    f"چه مواردی اعمال شود؟\n\n"
+                    f"✅ نام و نام خانوادگی (همیشه)\n"
+                    f"🖼 عکس پروفایل (تا 5 عکس ذخیره شده)\n"
+                    f"📝 بیو\n"
+                    f"🔤 یوزرنیم (با پسوند رندوم)\n\n"
+                    f"گزینه مورد نظر را انتخاب کنید:",
+                    buttons=[
+                        [Button.inline("🖼 نام + عکس", b"apply_opt_name_photo")],
+                        [Button.inline("📝 نام + بیو", b"apply_opt_name_bio")],
+                        [Button.inline("🎨 نام + عکس + بیو", b"apply_opt_name_photo_bio")],
+                        [Button.inline("🔤 همه (با یوزرنیم)", b"apply_opt_all")],
+                        [Button.inline("❌ لغو", b"cancel")]
+                    ]
+                )
+
         @self.bot.on(events.CallbackQuery(pattern=b"skip_time_limit"))
         async def skip_time_limit_callback(event):
             """رد کردن محدودیت زمانی"""
@@ -3856,191 +4958,30 @@ class BotHandler:
             state = self.user_states[user_id]
             current_step = state.get('step', '')
             
-            # چک کردن اینکه آیا اطلاعات لازم موجود است
-            if 'selected_accounts' not in state or 'workers' not in state:
-                await event.answer("❌ خطا: اطلاعات ناقص است. لطفاً دوباره شروع کنید", alert=True)
-                del self.user_states[user_id]
-                return
-            
-            # ذخیره تاخیر سفارشی به عنوان None (بدون محدودیت)
-            state['custom_delay'] = None
-            state['time_limit_text'] = ''
-            
-            # تشخیص نوع عملیات و اجرا
-            if 'join' in current_step:
-                if 'channel_link' not in state:
-                    await event.answer("❌ خطا: لینک کانال موجود نیست", alert=True)
-                    return
+            # فقط برای scenario_time_limit کار می‌کنه
+            if current_step == 'scenario_time_limit':
+                # شبیه‌سازی ارسال /skip
+                # ساخت یک event جعلی با متن /skip
+                class FakeMessage:
+                    def __init__(self):
+                        self.text = '/skip'
+                
+                class FakeEvent:
+                    def __init__(self, original_event):
+                        self.sender_id = original_event.sender_id
+                        self.message = FakeMessage()
+                        self._original = original_event
                     
-                channel_link = state['channel_link']
-                results_text, progress_msg, results = await self._execute_bulk_operation(
-                    event, user_id, state, 'join',
-                    self.channel_manager.bulk_join,
-                    channel_link=channel_link
-                )
-                await progress_msg.edit(
-                    results_text,
-                    buttons=[
-                        [Button.inline("🔗 جوین مجدد", b"join_channel")],
-                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
-                    ]
-                )
-                await self.db.log_action('bulk_join', user_id, f"{channel_link} - {results['success']}/{len(state['selected_accounts'])}")
-                del self.user_states[user_id]
+                    async def respond(self, *args, **kwargs):
+                        return await self._original.respond(*args, **kwargs)
                 
-            elif 'leave' in current_step:
-                if 'channel_link' not in state:
-                    await event.answer("❌ خطا: لینک کانال موجود نیست", alert=True)
-                    return
-                    
-                channel_link = state['channel_link']
-                results_text, progress_msg, results = await self._execute_bulk_operation(
-                    event, user_id, state, 'leave',
-                    self.channel_manager.bulk_leave,
-                    channel_link=channel_link
-                )
-                await progress_msg.edit(
-                    results_text,
-                    buttons=[
-                        [Button.inline("🚪 لفت مجدد", b"leave_channel")],
-                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
-                    ]
-                )
-                await self.db.log_action('bulk_leave', user_id, f"{channel_link} - {results['success']}/{len(state['selected_accounts'])}")
-                del self.user_states[user_id]
+                fake_event = FakeEvent(event)
                 
-            elif 'referral' in current_step:
-                bot_username = state.get('bot_username')
-                start_param = state.get('start_param')
-                click_button = state.get('click_button')
-                
-                if not bot_username or not start_param:
-                    await event.answer("❌ خطا: اطلاعات رفرال موجود نیست", alert=True)
-                    return
-                
-                results_text, progress_msg, results = await self._execute_bulk_operation(
-                    event, user_id, state, 'referral',
-                    self.referral_manager.bulk_start_bot,
-                    bot_username=bot_username,
-                    start_param=start_param,
-                    click_button=click_button
-                )
-                
-                # نمایش نتایج با جزئیات دکمه
-                if click_button and results.get('button_clicked', 0) > 0:
-                    results_text += f"\n🔘 دکمه کلیک شده: {results['button_clicked']}"
-                
-                await progress_msg.edit(
-                    results_text,
-                    buttons=[
-                        [Button.inline("🤖 استارت مجدد", b"start_referral")],
-                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
-                    ]
-                )
-                await self.db.log_action('bulk_referral', user_id, f"@{bot_username} - {results['success']}/{len(state['selected_accounts'])}")
-                del self.user_states[user_id]
-                
-            elif 'message' in current_step:
-                target = state.get('target')
-                message = state.get('message')
-                
-                if not target or not message:
-                    await event.answer("❌ خطا: اطلاعات پیام موجود نیست", alert=True)
-                    return
-                
-                results_text, progress_msg, results = await self._execute_bulk_operation(
-                    event, user_id, state, 'message',
-                    self.message_sender.bulk_send_message,
-                    target=target,
-                    message=message
-                )
-                await progress_msg.edit(
-                    results_text,
-                    buttons=[
-                        [Button.inline("💬 ارسال مجدد", b"send_message")],
-                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
-                    ]
-                )
-                await self.db.log_action('bulk_message', user_id, f"{target} - {results['success']}/{len(state['selected_accounts'])}")
-                del self.user_states[user_id]
-                
-            elif 'react' in current_step:
-                channel_link = state.get('channel_link')
-                message_id = state.get('message_id')
-                reaction_count = state.get('reaction_count', 5)
-                
-                if not channel_link or not message_id:
-                    await event.answer("❌ خطا: اطلاعات ری‌اکشن موجود نیست", alert=True)
-                    return
-                
-                results_text, progress_msg, results = await self._execute_bulk_operation(
-                    event, user_id, state, 'react',
-                    self.reaction_manager.bulk_react_and_view,
-                    channel_link=channel_link,
-                    message_id=message_id,
-                    reaction_count=reaction_count
-                )
-                await progress_msg.edit(
-                    results_text,
-                    buttons=[
-                        [Button.inline("❤️ ری‌اکشن مجدد", b"react_post")],
-                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
-                    ]
-                )
-                await self.db.log_action('bulk_react', user_id, f"{channel_link}/{message_id} - {results['success']}/{len(state['selected_accounts'])}")
-                del self.user_states[user_id]
-                
-            elif 'block' in current_step:
-                target = state.get('target')
-                
-                if not target:
-                    await event.answer("❌ خطا: اطلاعات بلاک موجود نیست", alert=True)
-                    return
-                
-                results_text, progress_msg, results = await self._execute_bulk_operation(
-                    event, user_id, state, 'block',
-                    self.block_manager.bulk_block,
-                    target=target
-                )
-                await progress_msg.edit(
-                    results_text,
-                    buttons=[
-                        [Button.inline("🚫 بلاک مجدد", b"block_user")],
-                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
-                    ]
-                )
-                await self.db.log_action('bulk_block', user_id, f"{target} - {results['success']}/{len(state['selected_accounts'])}")
-                del self.user_states[user_id]
-                
-            elif 'unblock' in current_step:
-                target = state.get('target')
-                
-                if not target:
-                    await event.answer("❌ خطا: اطلاعات انبلاک موجود نیست", alert=True)
-                    return
-                
-                results_text, progress_msg, results = await self._execute_bulk_operation(
-                    event, user_id, state, 'unblock',
-                    self.block_manager.bulk_unblock,
-                    target=target
-                )
-                await progress_msg.edit(
-                    results_text,
-                    buttons=[
-                        [Button.inline("✅ انبلاک مجدد", b"block_user")],
-                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
-                    ]
-                )
-                await self.db.log_action('bulk_unblock', user_id, f"{target} - {results['success']}/{len(state['selected_accounts'])}")
-                del self.user_states[user_id]
-                
-            elif 'scenario' in current_step:
-                # برای سناریو، کاربر باید /skip رو تایپ کنه
-                # چون کد سناریو پیچیده‌تر است و در پس‌زمینه اجرا میشه
-                await event.answer("⚠️ لطفاً /skip را تایپ کنید یا عدد دقیقه وارد کنید", alert=True)
-            
+                # فراخوانی handler اصلی با event جعلی
+                # این کار باعث میشه کد scenario_time_limit اجرا بشه
+                await message_handler(fake_event)
             else:
-                await event.answer("❌ خطا در تشخیص نوع عملیات", alert=True)
+                await event.answer("❌ این دکمه فقط برای سناریو کار می‌کند", alert=True)
         
         @self.bot.on(events.CallbackQuery(pattern=b"cancel_scenario"))
         async def cancel_scenario_callback(event):
@@ -4304,12 +5245,12 @@ class BotHandler:
                 "```\n"
                 "@PacketNetEmergencyBot\n"
                 "start: ref_123\n"
-                "join: https://t.me/PacketNet\n"
+                "join_addlist: https://t.me/addlist/BJ1gpHd43ew2MzQx\n"
                 "click: عضو شدم\n"
                 "solve_captcha: send\n"
                 "share_phone:\n"
                 "stop: 3\n"
-                "leave: https://t.me/PacketNet\n"
+                "leave_addlist: https://t.me/addlist/BJ1gpHd43ew2MzQx\n"
                 "\n"
                 "@NullVIPBot\n"
                 "start: ref_456\n"
@@ -4319,14 +5260,33 @@ class BotHandler:
                 "share_phone:\n"
                 "leave: https://t.me/NullNetwork\n"
                 "```\n\n"
-                "📋 **دستورات:**\n"
-                "• `start, send, click, solve_captcha, share_phone, join, leave, wait, stop, forward`\n"
-                "• متغیرها: `{random:N}, {random_upper:N}, {random_num:N}`\n"
-                "• کلیک: با متن یا شماره (`click: #0`)\n"
-                "• حل کپچا: `solve_captcha: send` یا `solve_captcha: click` یا `solve_captcha: send, 3` (بررسی 3 پیام آخر)\n"
-                "• اشتراک شماره: `share_phone:` (خودکار شماره اکانت رو میفرسته)\n"
-                "• توقف: `stop: 5` (5 ثانیه توقف)\n"
-                "• فوروارد: `forward: 3, @ch` یا `forward: \"متن\", @ch`\n\n"
+                "📋 **دستورات** (روی هر کدام کلیک کنید تا کپی شود):\n\n"
+                "`start: ref_id`\n"
+                "`send: متن پیام`\n"
+                "`click: متن دکمه`  یا  `click: #0`\n"
+                "`auto_join`\n"
+                "`auto_join: no_click`\n"
+                "`auto_join_leave`  یا  `ajl`\n"
+                "`auto_join_leave: no_click`\n"
+                "`join: https://t.me/channel`\n"
+                "`leave: https://t.me/channel`\n"
+                "`jl: https://t.me/channel`\n"
+                "`join_addlist: https://t.me/addlist/...`\n"
+                "`leave_addlist: https://t.me/addlist/...`\n"
+                "`solve_captcha: send`\n"
+                "`solve_captcha: click`\n"
+                "`solve_captcha: send, 3`\n"
+                "`share_phone:`\n"
+                "`forward: 3, @channel`\n"
+                "`wait: 5`\n"
+                "`stop: 5`\n"
+                "`wait_for: 30`\n"
+                "`wait_for: 30, کیف پول`\n"
+                "`wait_for: 30, button`\n"
+                "`smart_delay: on`\n"
+                "`smart_delay: on, 30`\n"
+                "`smart_delay: off`\n"
+                "`{random:8}`  یا  `{random_upper:6}`  یا  `{random_num:4}`\n\n"
                 "🎯 **انتخاب اکانت‌ها:**\n"
                 "• `5` - 5 اکانت اول\n"
                 "• `/all` - همه اکانت‌ها\n"
@@ -4346,6 +5306,313 @@ class BotHandler:
                 buttons=Button.inline("❌ لغو", b"cancel")
             )
             self.user_states[event.sender_id] = {'step': 'scenario_input'}
+        
+        @self.bot.on(events.CallbackQuery(pattern=b"leecher"))
+        async def leecher_callback(event):
+            """شروع فرآیند لیچر"""
+            # بررسی دسترسی ادمین
+            if not await self._check_admin_access(event):
+                return
+            
+            await event.answer()
+            
+            accounts = await self.db.get_accounts(event.sender_id)
+            
+            if not accounts:
+                await event.edit(
+                    "❌ شما هنوز اکانتی اضافه نکرده‌اید.\n"
+                    "ابتدا یک اکانت اضافه کنید.",
+                    buttons=Button.inline("➕ افزودن اکانت", b"add_account")
+                )
+                return
+            
+            await event.edit(
+                "👥 **لیچر - استخراج اعضای گروه**\n\n"
+                "با این قابلیت می‌توانید اعضای یک گروه را استخراج کنید.\n\n"
+                "🎯 **ویژگی‌ها:**\n"
+                "• استخراج اعضای هویت‌دار (با پروفایل، نام کامل، یوزرنیم، بیو)\n"
+                "• استفاده همزمان از چند اکانت\n"
+                "• جلوگیری از تکراری\n"
+                "• تقسیم هوشمند بین اکانت‌ها\n"
+                "• ذخیره اطلاعات کامل اعضا\n\n"
+                "📋 **مراحل:**\n"
+                "1️⃣ لینک گروه را ارسال کنید\n"
+                "2️⃣ تعداد اکانت برای لیچ را مشخص کنید\n"
+                "3️⃣ تعداد اعضای مورد نظر را وارد کنید\n"
+                "4️⃣ منتظر بمانید تا لیچ تکمیل شود\n\n"
+                "💡 **نکات:**\n"
+                "• فقط اعضای هویت‌دار استخراج می‌شوند\n"
+                "• اعضای تکراری حذف می‌شوند\n"
+                "• نتیجه در فایل Excel ذخیره می‌شود\n\n"
+                "🔗 **حالا لینک گروه را ارسال کنید:**\n"
+                "(مثال: https://t.me/groupname یا @groupname)",
+                buttons=Button.inline("❌ لغو", b"cancel")
+            )
+            self.user_states[event.sender_id] = {'step': 'leech_link'}
+        
+        @self.bot.on(events.CallbackQuery(pattern=b"apply_profiles"))
+        async def apply_profiles_callback(event):
+            """شروع فرآیند اعمال پروفایل از دیتابیس"""
+            # بررسی دسترسی ادمین
+            if not await self._check_admin_access(event):
+                return
+
+            await event.answer()
+
+            accounts = await self.db.get_accounts(event.sender_id)
+            active_accounts = [acc for acc in accounts if acc.status == 'active' and acc.session_path]
+
+            if not active_accounts:
+                await event.edit(
+                    "❌ شما هنوز اکانت فعالی ندارید.\n"
+                    "ابتدا یک اکانت اضافه کنید.",
+                    buttons=Button.inline("➕ افزودن اکانت", b"add_account")
+                )
+                return
+
+            # آمار پروفایل‌های موجود در دیتابیس
+            stats = await self.db.get_profiles_stats(event.sender_id)
+
+            if stats['unused'] == 0:
+                await event.edit(
+                    "❌ **هیچ پروفایل استفاده‌نشده‌ای ندارید!**\n\n"
+                    f"📊 وضعیت پروفایل‌های شما:\n"
+                    f"• کل: {stats['total']}\n"
+                    f"• استفاده شده: {stats['used']}\n"
+                    f"• استفاده نشده: {stats['unused']}\n\n"
+                    f"💡 ابتدا از **👥 لیچر** پروفایل جمع‌آوری کنید.",
+                    buttons=[
+                        [Button.inline("👥 لیچر", b"leecher")],
+                        [Button.inline("🔙 منوی اصلی", b"back_to_menu")]
+                    ]
+                )
+                return
+
+            await event.edit(
+                f"🎨 **اعمال پروفایل روی اکانت‌ها**\n\n"
+                f"📊 **پروفایل‌های شما در دیتابیس:**\n"
+                f"• استفاده نشده: {stats['unused']}\n"
+                f"• استفاده شده: {stats['used']}\n"
+                f"• کل: {stats['total']}\n\n"
+                f"👥 اکانت‌های فعال شما: {len(active_accounts)}\n\n"
+                f"📋 **مراحل:**\n"
+                f"1️⃣ تعداد اکانت را مشخص کنید\n"
+                f"2️⃣ نوع اطلاعات مورد نظر را انتخاب کنید\n"
+                f"3️⃣ منتظر بمانید\n\n"
+                f"💡 هر اکانت یک پروفایل یونیک از دیتابیس می‌گیرد.\n\n"
+                f"چند تا اکانت برای اعمال استفاده شود؟\n"
+                f"• عدد بفرست یا `/all` برای همه",
+                buttons=Button.inline("❌ لغو", b"cancel")
+            )
+            self.user_states[event.sender_id] = {
+                'step': 'apply_account_count',
+                'active_accounts': active_accounts,
+            }
+        
+        @self.bot.on(events.CallbackQuery(pattern=b"apply_opt_name_photo"))
+        async def apply_opt_name_photo_callback(event):
+            """اعمال نام + عکس"""
+            await self._apply_from_excel_handler(event, apply_photo=True, apply_bio=False, apply_username=False)
+        
+        @self.bot.on(events.CallbackQuery(pattern=b"apply_opt_name_bio"))
+        async def apply_opt_name_bio_callback(event):
+            """اعمال نام + بیو"""
+            await self._apply_from_excel_handler(event, apply_photo=False, apply_bio=True, apply_username=False)
+        
+        @self.bot.on(events.CallbackQuery(pattern=b"apply_opt_name_photo_bio"))
+        async def apply_opt_name_photo_bio_callback(event):
+            """اعمال نام + عکس + بیو"""
+            await self._apply_from_excel_handler(event, apply_photo=True, apply_bio=True, apply_username=False)
+        
+        @self.bot.on(events.CallbackQuery(pattern=b"apply_opt_all"))
+        async def apply_opt_all_callback(event):
+            """اعمال همه (با یوزرنیم)"""
+            await self._apply_from_excel_handler(event, apply_photo=True, apply_bio=True, apply_username=True)
+
+        @self.bot.on(events.CallbackQuery(pattern=b"apply_report_txt"))
+        async def apply_report_txt_callback(event):
+            """ارسال گزارش کامل اعمال پروفایل به صورت TXT"""
+            if not await self._check_admin_access(event):
+                return
+            await event.answer("⏳ در حال آماده‌سازی فایل...", alert=False)
+
+            user_id = event.sender_id
+            state = self.user_states.get(user_id, {})
+            details = state.get('apply_details', [])
+
+            if not details:
+                await event.answer("❌ اطلاعاتی یافت نشد!", alert=True)
+                return
+
+            lines = []
+            lines.append("=" * 55)
+            lines.append("🎨 گزارش اعمال پروفایل")
+            lines.append(f"تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+            lines.append(f"تعداد کل: {len(details)}")
+            ok = sum(1 for d in details if d['status'] == 'ok')
+            fail = len(details) - ok
+            lines.append(f"موفق: {ok}  |  ناموفق: {fail}")
+            lines.append("=" * 55)
+            lines.append("")
+
+            for i, d in enumerate(details, 1):
+                icon = "✅" if d['status'] == 'ok' else "❌"
+                lines.append(f"{icon} [{i}] شماره ما    : {d['acc_phone']}")
+                lines.append(f"     آیدی ما     : {d['acc_id']}")
+                lines.append(f"     یوزرنیم ما  : @{d['acc_user']}" if d['acc_user'] != '—' else f"     یوزرنیم ما  : —")
+                lines.append(f"     آیدی منبع   : {d['src_id']}")
+                lines.append(f"     نام جدید    : {d['new_name']}")
+                if d['new_user'] != '—':
+                    lines.append(f"     یوزرنیم جدید: @{d['new_user']}")
+                if d['bio']:
+                    lines.append(f"     بیو          : {d['bio']}")
+                lines.append(f"     اعمال شده   : {d['applied']}")
+                lines.append("")
+
+            import io as _io
+            content = "\n".join(lines)
+            file_bytes = _io.BytesIO(content.encode("utf-8"))
+            file_bytes.name = f"apply_report_{user_id}.txt"
+
+            await self.bot.send_file(
+                event.chat_id,
+                file_bytes,
+                caption=f"📄 **گزارش کامل اعمال پروفایل**\n✅ {ok} موفق  ❌ {fail} ناموفق",
+                attributes=[],
+            )
+        
+        @self.bot.on(events.CallbackQuery(pattern=b"all_countries"))
+        async def all_countries_callback(event):
+            """انتخاب همه کشورها"""
+            user_id = event.sender_id
+            
+            if user_id not in self.user_states:
+                await event.answer("❌ خطا! لطفاً دوباره تلاش کنید.", alert=True)
+                return
+            
+            await event.answer()
+            
+            state = self.user_states[user_id]
+            
+            # استفاده از همه اکانت‌ها (بدون فیلتر کشور)
+            state['selected_country'] = None
+            filtered_accounts = state['active_accounts']
+            state['step'] = 'scenario_count'
+            
+            # بررسی پیشرفت قبلی
+            scenario_text = state.get('scenario_text')
+            scenario_summary = state.get('scenario_summary')
+            progress = await self.db.get_scenario_progress(user_id, scenario_text)
+            
+            if progress and progress['last_account_index'] > 0:
+                # سناریو قبلاً شروع شده
+                last_index = progress['last_account_index']
+                total = progress['total_accounts']
+                
+                buttons = [
+                    [Button.inline(f"▶️ ادامه از اکانت {last_index + 1}", b"resume_scenario")],
+                    [Button.inline("🔄 شروع از اول", b"restart_scenario")],
+                    [Button.inline("🎯 انتخاب دستی", b"manual_select_scenario")],
+                    [Button.inline("❌ لغو", b"cancel")]
+                ]
+                
+                await event.edit(
+                    f"⚠️ **سناریو قبلاً شروع شده!**\n\n"
+                    f"{scenario_summary}\n"
+                    f"📊 پیشرفت قبلی: {last_index}/{total} اکانت\n\n"
+                    f"می‌خواهید از کجا ادامه دهید?",
+                    buttons=buttons
+                )
+            else:
+                # سناریو جدید
+                await event.edit(
+                    f"📊 **انتخاب تعداد اکانت**\n\n"
+                    f"{scenario_summary}\n"
+                    f"🌍 کشور: همه کشورها\n"
+                    f"شما {len(filtered_accounts)} اکانت فعال دارید.\n\n"
+                    f"چند تا اکانت برای اجرای سناریو استفاده شود؟\n\n"
+                    f"💡 **گزینه‌ها:**\n"
+                    f"• عدد بفرست (مثلاً `5`) - از اول شروع میشه\n"
+                    f"• `/all` - همه اکانت‌ها\n"
+                    f"• `/from 70` - از اکانت 70 شروع کن\n"
+                    f"• `/from 70 to 100` - از 70 تا 100",
+                    buttons=Button.inline("❌ لغو", b"cancel")
+                )
+        
+        @self.bot.on(events.CallbackQuery(pattern=b"country_"))
+        async def country_select_callback(event):
+            """انتخاب کشور خاص"""
+            user_id = event.sender_id
+            
+            if user_id not in self.user_states:
+                await event.answer("❌ خطا! لطفاً دوباره تلاش کنید.", alert=True)
+                return
+            
+            # استخراج کد کشور از callback data
+            country_code = event.data.decode().replace('country_', '')
+            
+            await event.answer()
+            
+            state = self.user_states[user_id]
+            
+            # فیلتر اکانت‌ها بر اساس کشور
+            state['selected_country'] = country_code
+            filtered_accounts = [acc for acc in state['active_accounts'] if acc.country_code == country_code]
+            
+            if not filtered_accounts:
+                from src.utils.countries import get_country_name
+                await event.answer(
+                    f"❌ هیچ اکانتی از {get_country_name(country_code)} پیدا نشد!",
+                    alert=True
+                )
+                return
+            
+            # بروزرسانی لیست اکانت‌های فعال
+            state['active_accounts'] = filtered_accounts
+            state['step'] = 'scenario_count'
+            
+            # بررسی پیشرفت قبلی
+            scenario_text = state.get('scenario_text')
+            scenario_summary = state.get('scenario_summary')
+            progress = await self.db.get_scenario_progress(user_id, scenario_text)
+            
+            if progress and progress['last_account_index'] > 0:
+                # سناریو قبلاً شروع شده
+                last_index = progress['last_account_index']
+                total = progress['total_accounts']
+                
+                buttons = [
+                    [Button.inline(f"▶️ ادامه از اکانت {last_index + 1}", b"resume_scenario")],
+                    [Button.inline("🔄 شروع از اول", b"restart_scenario")],
+                    [Button.inline("🎯 انتخاب دستی", b"manual_select_scenario")],
+                    [Button.inline("❌ لغو", b"cancel")]
+                ]
+                
+                from src.utils.countries import get_country_name
+                await event.edit(
+                    f"⚠️ **سناریو قبلاً شروع شده!**\n\n"
+                    f"{scenario_summary}\n"
+                    f"🌍 کشور: {get_country_name(country_code)}\n"
+                    f"📊 پیشرفت قبلی: {last_index}/{total} اکانت\n\n"
+                    f"می‌خواهید از کجا ادامه دهید?",
+                    buttons=buttons
+                )
+            else:
+                # سناریو جدید
+                from src.utils.countries import get_country_name
+                await event.edit(
+                    f"📊 **انتخاب تعداد اکانت**\n\n"
+                    f"{scenario_summary}\n"
+                    f"🌍 کشور: {get_country_name(country_code)}\n"
+                    f"شما {len(filtered_accounts)} اکانت فعال دارید.\n\n"
+                    f"چند تا اکانت برای اجرای سناریو استفاده شود؟\n\n"
+                    f"💡 **گزینه‌ها:**\n"
+                    f"• عدد بفرست (مثلاً `5`) - از اول شروع میشه\n"
+                    f"• `/all` - همه اکانت‌ها\n"
+                    f"• `/from 70` - از اکانت 70 شروع کن\n"
+                    f"• `/from 70 to 100` - از 70 تا 100",
+                    buttons=Button.inline("❌ لغو", b"cancel")
+                )
         
         @self.bot.on(events.CallbackQuery(pattern=b"resume_scenario"))
         async def resume_scenario_callback(event):
@@ -4525,66 +5792,402 @@ class BotHandler:
                     del self.user_states[user_id]
 
         
-        @self.bot.on(events.CallbackQuery(pattern=b"my_notes"))
-        async def my_notes_callback(event):
-            """نمایش یادداشت‌های کاربر"""
-            # بررسی دسترسی ادمین
-            if not await self._check_admin_access(event):
-                return
-            
-            await event.answer()
-            
-            user_id = event.sender_id
+        # ─── تابع کمکی برای ساخت صفحه یادداشت‌ها ───────────────────────────
+        async def _build_notes_page(user_id: int, page: int = 0) -> tuple:
+            """
+            ساخت متن و دکمه‌های صفحه‌بندی یادداشت‌ها
+            Returns: (text, buttons)
+            """
+            BOTS_PER_PAGE = 5  # تعداد ربات در هر صفحه
+
             notes = await self.note_manager.get_user_notes(user_id)
-            
+
             if not notes:
-                await event.edit(
+                return (
                     "📝 **یادداشت‌های من**\n\n"
                     "❌ شما هنوز یادداشتی ثبت نکرده‌اید.\n\n"
                     "💡 بعد از اجرای سناریوها، می‌توانید یادداشت ثبت کنید.",
-                    buttons=Button.inline("🔙 بازگشت", b"back_to_menu")
+                    [[Button.inline("🔙 بازگشت", b"back_to_menu")]]
                 )
-                return
-            
-            # گروه‌بندی یادداشت‌ها بر اساس ربات
+
+            # گروه‌بندی بر اساس ربات
             bots_notes = {}
             for note in notes:
                 bot = note['bot_username']
                 if bot not in bots_notes:
                     bots_notes[bot] = []
                 bots_notes[bot].append(note)
-            
+
+            bot_list = list(bots_notes.items())
+            total_bots = len(bot_list)
+            total_pages = max(1, (total_bots + BOTS_PER_PAGE - 1) // BOTS_PER_PAGE)
+            page = max(0, min(page, total_pages - 1))
+
+            start = page * BOTS_PER_PAGE
+            end = start + BOTS_PER_PAGE
+            page_bots = bot_list[start:end]
+
             text = "📝 **یادداشت‌های من**\n\n"
             text += f"📊 تعداد کل: {len(notes)} یادداشت\n"
-            text += f"🤖 تعداد رباتها: {len(bots_notes)}\n\n"
-            
-            # نمایش یادداشت‌ها
-            for bot_username, bot_notes in list(bots_notes.items())[:10]:
+            text += f"🤖 تعداد رباتها: {total_bots}\n"
+            text += f"📄 صفحه {page + 1} از {total_pages}\n\n"
+
+            for bot_username, bot_notes in page_bots:
                 text += f"🤖 **@{bot_username}** ({len(bot_notes)} یادداشت)\n"
                 for note in bot_notes[:2]:
-                    note_preview = note['note_text'][:50]
-                    if len(note['note_text']) > 50:
+                    note_preview = note['note_text'][:60]
+                    if len(note['note_text']) > 60:
                         note_preview += "..."
                     text += f"   • {note_preview}\n"
                     text += f"     📅 {note['created_at'][:10]}\n"
                 if len(bot_notes) > 2:
                     text += f"   ... و {len(bot_notes) - 2} یادداشت دیگر\n"
                 text += "\n"
-            
-            if len(bots_notes) > 10:
-                text += f"... و {len(bots_notes) - 10} ربات دیگر\n\n"
-            
-            text += "💡 برای مشاهده یادداشت‌های یک ربات خاص:\n"
-            text += "`/notes @bot_username`"
-            
-            await event.edit(
-                text,
-                buttons=[
-                    [Button.inline("🗑 حذف یادداشت", b"delete_note_menu")],
-                    [Button.inline("🔙 بازگشت", b"back_to_menu")]
-                ]
+
+            text += "💡 برای مشاهده کامل: `/notes @bot_username`"
+
+            # دکمه‌های ناوبری
+            nav_row = []
+            if page > 0:
+                nav_row.append(Button.inline("◀️ قبلی", f"notes_page_{page - 1}".encode()))
+            if page < total_pages - 1:
+                nav_row.append(Button.inline("بعدی ▶️", f"notes_page_{page + 1}".encode()))
+
+            buttons = []
+            if nav_row:
+                buttons.append(nav_row)
+            buttons.append([
+                Button.inline("📄 دریافت TXT", b"notes_export_txt"),
+                Button.inline("🗑 حذف یادداشت", b"delete_note_menu"),
+            ])
+            buttons.append([Button.inline("📋 تاریخچه رباتها", b"bot_history")])
+            buttons.append([Button.inline("🔙 بازگشت", b"back_to_menu")])
+
+            return text, buttons
+
+        @self.bot.on(events.CallbackQuery(pattern=b"my_notes"))
+        async def my_notes_callback(event):
+            """نمایش یادداشت‌های کاربر - صفحه اول"""
+            if not await self._check_admin_access(event):
+                return
+            await event.answer()
+            user_id = event.sender_id
+            text, buttons = await _build_notes_page(user_id, page=0)
+            await event.edit(text, buttons=buttons)
+
+        @self.bot.on(events.CallbackQuery(pattern=rb"notes_page_(\d+)"))
+        async def notes_page_callback(event):
+            """صفحه‌بندی یادداشت‌ها"""
+            if not await self._check_admin_access(event):
+                return
+            await event.answer()
+            user_id = event.sender_id
+            page = int(event.pattern_match.group(1))
+            text, buttons = await _build_notes_page(user_id, page=page)
+            await event.edit(text, buttons=buttons)
+
+        @self.bot.on(events.CallbackQuery(pattern=b"notes_export_txt"))
+        async def notes_export_txt_callback(event):
+            """ارسال همه یادداشت‌ها به صورت فایل TXT"""
+            if not await self._check_admin_access(event):
+                return
+            await event.answer("⏳ در حال آماده‌سازی فایل...", alert=False)
+
+            user_id = event.sender_id
+            notes = await self.note_manager.get_user_notes(user_id)
+
+            if not notes:
+                await event.answer("❌ یادداشتی وجود ندارد!", alert=True)
+                return
+
+            # ساخت محتوای فایل
+            lines = []
+            lines.append("=" * 50)
+            lines.append("📝 یادداشت‌های من")
+            lines.append(f"تاریخ خروجی: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+            lines.append(f"تعداد کل: {len(notes)} یادداشت")
+            lines.append("=" * 50)
+            lines.append("")
+
+            # گروه‌بندی بر اساس ربات
+            bots_notes = {}
+            for note in notes:
+                bot = note['bot_username']
+                if bot not in bots_notes:
+                    bots_notes[bot] = []
+                bots_notes[bot].append(note)
+
+            for bot_username, bot_notes in bots_notes.items():
+                lines.append(f"🤖 ربات: @{bot_username}  ({len(bot_notes)} یادداشت)")
+                lines.append("-" * 40)
+                for i, note in enumerate(bot_notes, 1):
+                    lines.append(f"  [{i}] ID: {note['id']}")
+                    lines.append(f"  📅 ایجاد: {note['created_at'][:16]}")
+                    if note['updated_at'] != note['created_at']:
+                        lines.append(f"  ✏️ ویرایش: {note['updated_at'][:16]}")
+                    lines.append(f"  📝 متن:")
+                    for ln in note['note_text'].splitlines():
+                        lines.append(f"      {ln}")
+                    lines.append("")
+                lines.append("")
+
+            content = "\n".join(lines)
+
+            import io
+            file_bytes = io.BytesIO(content.encode("utf-8"))
+            file_bytes.name = f"notes_{user_id}.txt"
+
+            await self.bot.send_file(
+                event.chat_id,
+                file_bytes,
+                caption=f"📄 **یادداشت‌های شما**\n📊 {len(notes)} یادداشت از {len(bots_notes)} ربات",
+                attributes=[],
             )
-        
+
+        # ─── تابع کمکی برای ساخت صفحه تاریخچه ──────────────────────────────
+        async def _build_history_page(user_id: int, page: int = 0) -> tuple:
+            """
+            ساخت متن و دکمه‌های صفحه‌بندی تاریخچه رباتها
+            گروه‌بندی بر اساس تاریخ (امروز / دیروز / این هفته / قدیمی‌تر)
+            Returns: (text, buttons)
+            """
+            from datetime import date, timedelta
+
+            ITEMS_PER_PAGE = 8  # تعداد ربات در هر صفحه
+
+            history = await self.db.get_bot_history(user_id, limit=500)
+
+            if not history:
+                return (
+                    "📋 **تاریخچه رباتها**\n\n"
+                    "❌ هنوز هیچ سناریویی اجرا نشده.\n\n"
+                    "💡 بعد از اجرای سناریو، رباتها اینجا ثبت می‌شوند.",
+                    [[Button.inline("🔙 بازگشت", b"my_notes")]]
+                )
+
+            today = date.today()
+            yesterday = today - timedelta(days=1)
+            week_ago = today - timedelta(days=7)
+
+            # گروه‌بندی بر اساس تاریخ
+            groups = {"امروز 🌅": [], "دیروز 🌙": [], "این هفته 📅": [], "قدیمی‌تر 🗂": []}
+            for row in history:
+                try:
+                    row_date = date.fromisoformat(row['executed_at'][:10])
+                except Exception:
+                    row_date = today
+                if row_date == today:
+                    groups["امروز 🌅"].append(row)
+                elif row_date == yesterday:
+                    groups["دیروز 🌙"].append(row)
+                elif row_date >= week_ago:
+                    groups["این هفته 📅"].append(row)
+                else:
+                    groups["قدیمی‌تر 🗂"].append(row)
+
+            # فهرست مسطح برای صفحه‌بندی (هر آیتم یک اجرا)
+            flat = []
+            for group_name, rows in groups.items():
+                if rows:
+                    flat.append(('header', group_name, len(rows)))
+                    for row in rows:
+                        flat.append(('row', row))
+
+            # صفحه‌بندی روی ردیف‌های واقعی (نه هدرها)
+            real_rows = [i for i, item in enumerate(flat) if item[0] == 'row']
+            total_items = len(real_rows)
+            total_pages = max(1, (total_items + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE)
+            page = max(0, min(page, total_pages - 1))
+
+            page_start_real = page * ITEMS_PER_PAGE
+            page_end_real = page_start_real + ITEMS_PER_PAGE
+            visible_real_indices = set(real_rows[page_start_real:page_end_real])
+
+            # پیدا کردن هدرهایی که باید نشون داده بشن
+            visible_header_indices = set()
+            for idx in visible_real_indices:
+                # هدر قبل از این ردیف
+                for h in range(idx - 1, -1, -1):
+                    if flat[h][0] == 'header':
+                        visible_header_indices.add(h)
+                        break
+
+            text = "📋 **تاریخچه رباتها**\n"
+            text += f"📊 {total_items} اجرا ثبت شده\n"
+            text += f"📄 صفحه {page + 1} از {total_pages}\n"
+            text += "─" * 30 + "\n\n"
+
+            last_header = None
+            for idx, item in enumerate(flat):
+                if item[0] == 'header':
+                    if idx in visible_header_indices:
+                        last_header = item[1]
+                        text += f"\n**{item[1]}** ({item[2]} اجرا)\n"
+                        text += "━" * 20 + "\n"
+                elif item[0] == 'row' and idx in visible_real_indices:
+                    row = item[1]
+                    bot = row['bot_username']
+                    t = row['executed_at'][11:16]  # HH:MM
+                    d = row['executed_at'][:10]
+                    total_acc = row['accounts_total']
+                    ok = row['accounts_success']
+                    fail = row['accounts_failed']
+                    rate = int((ok / total_acc) * 100) if total_acc > 0 else 0
+                    # آیکون موفقیت
+                    if rate >= 90:
+                        icon = "🟢"
+                    elif rate >= 60:
+                        icon = "🟡"
+                    else:
+                        icon = "🔴"
+                    text += f"{icon} **@{bot}**\n"
+                    text += f"   🕐 {d} {t}  |  👥 {total_acc} اکانت\n"
+                    text += f"   ✅ {ok} موفق  ❌ {fail} ناموفق  ({rate}%)\n\n"
+
+            text += "─" * 30 + "\n"
+            text += "💡 `/history @bot` برای جزئیات یک ربات"
+
+            # دکمه‌های ناوبری
+            nav_row = []
+            if page > 0:
+                nav_row.append(Button.inline("◀️ قبلی", f"history_page_{page - 1}".encode()))
+            if page < total_pages - 1:
+                nav_row.append(Button.inline("بعدی ▶️", f"history_page_{page + 1}".encode()))
+
+            buttons = []
+            if nav_row:
+                buttons.append(nav_row)
+            buttons.append([
+                Button.inline("📄 دریافت TXT", b"history_export_txt"),
+            ])
+            buttons.append([Button.inline("🔙 یادداشت‌ها", b"my_notes")])
+
+            return text, buttons
+
+        @self.bot.on(events.CallbackQuery(pattern=b"bot_history"))
+        async def bot_history_callback(event):
+            """نمایش تاریخچه رباتها - صفحه اول"""
+            if not await self._check_admin_access(event):
+                return
+            await event.answer()
+            user_id = event.sender_id
+            text, buttons = await _build_history_page(user_id, page=0)
+            await event.edit(text, buttons=buttons)
+
+        @self.bot.on(events.CallbackQuery(pattern=rb"history_page_(\d+)"))
+        async def history_page_callback(event):
+            """صفحه‌بندی تاریخچه"""
+            if not await self._check_admin_access(event):
+                return
+            await event.answer()
+            user_id = event.sender_id
+            page = int(event.pattern_match.group(1))
+            text, buttons = await _build_history_page(user_id, page=page)
+            await event.edit(text, buttons=buttons)
+
+        @self.bot.on(events.CallbackQuery(pattern=b"history_export_txt"))
+        async def history_export_txt_callback(event):
+            """ارسال تاریخچه به صورت فایل TXT"""
+            if not await self._check_admin_access(event):
+                return
+            await event.answer("⏳ در حال آماده‌سازی فایل...", alert=False)
+
+            user_id = event.sender_id
+            history = await self.db.get_bot_history(user_id, limit=500)
+
+            if not history:
+                await event.answer("❌ تاریخچه‌ای وجود ندارد!", alert=True)
+                return
+
+            lines = []
+            lines.append("=" * 50)
+            lines.append("📋 تاریخچه اجرای سناریو روی رباتها")
+            lines.append(f"تاریخ خروجی: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+            lines.append(f"تعداد کل اجراها: {len(history)}")
+            lines.append("=" * 50)
+            lines.append("")
+
+            current_date = None
+            for row in history:
+                row_date = row['executed_at'][:10]
+                if row_date != current_date:
+                    current_date = row_date
+                    lines.append(f"\n📅 {row_date}")
+                    lines.append("-" * 40)
+                t = row['executed_at'][11:16]
+                total_acc = row['accounts_total']
+                ok = row['accounts_success']
+                fail = row['accounts_failed']
+                rate = int((ok / total_acc) * 100) if total_acc > 0 else 0
+                lines.append(f"  {t}  @{row['bot_username']}")
+                lines.append(f"       👥 {total_acc} اکانت  |  ✅ {ok}  ❌ {fail}  ({rate}%)")
+                lines.append("")
+
+            content = "\n".join(lines)
+            import io
+            file_bytes = io.BytesIO(content.encode("utf-8"))
+            file_bytes.name = f"history_{user_id}.txt"
+
+            await self.bot.send_file(
+                event.chat_id,
+                file_bytes,
+                caption=f"📋 **تاریخچه رباتها**\n📊 {len(history)} اجرا ثبت شده",
+                attributes=[],
+            )
+
+        @self.bot.on(events.NewMessage(pattern='/history'))
+        async def history_command_handler(event):
+            """نمایش تاریخچه اجراها برای یک ربات خاص"""
+            user_id = event.sender_id
+            is_creator = user_id in Config.ADMIN_IDS
+            is_admin = await self.db.is_admin(user_id)
+            if not is_creator and not is_admin:
+                await event.respond("⛔️ این قابلیت فقط برای ادمین‌ها در دسترس است!")
+                return
+            try:
+                parts = event.message.text.split()
+                if len(parts) < 2:
+                    await event.respond(
+                        "❌ فرمت نادرست!\n\n"
+                        "استفاده: `/history @bot_username`\n"
+                        "مثال: `/history @MyBot`"
+                    )
+                    return
+                bot_username = parts[1].lstrip('@')
+                rows = await self.db.get_bot_history_by_username(user_id, bot_username)
+                if not rows:
+                    await event.respond(
+                        f"📋 **تاریخچه @{bot_username}**\n\n"
+                        f"❌ هیچ اجرایی برای این ربات ثبت نشده."
+                    )
+                    return
+                text = f"📋 **تاریخچه @{bot_username}**\n"
+                text += f"📊 {len(rows)} بار اجرا شده\n"
+                text += "─" * 30 + "\n\n"
+                total_ok = sum(r['accounts_success'] for r in rows)
+                total_fail = sum(r['accounts_failed'] for r in rows)
+                total_all = sum(r['accounts_total'] for r in rows)
+                overall_rate = int((total_ok / total_all) * 100) if total_all > 0 else 0
+                text += f"📈 **آمار کلی:**\n"
+                text += f"   👥 {total_all} اکانت  |  ✅ {total_ok}  ❌ {total_fail}  ({overall_rate}%)\n\n"
+                text += "**جزئیات اجراها:**\n"
+                for i, row in enumerate(rows[:20], 1):
+                    d = row['executed_at'][:10]
+                    t = row['executed_at'][11:16]
+                    ok = row['accounts_success']
+                    fail = row['accounts_failed']
+                    total_acc = row['accounts_total']
+                    rate = int((ok / total_acc) * 100) if total_acc > 0 else 0
+                    icon = "🟢" if rate >= 90 else ("🟡" if rate >= 60 else "🔴")
+                    text += f"{icon} **#{i}** — {d} {t}\n"
+                    text += f"   👥 {total_acc}  ✅ {ok}  ❌ {fail}  ({rate}%)\n\n"
+                if len(rows) > 20:
+                    text += f"... و {len(rows) - 20} اجرای دیگر\n"
+                await event.respond(text)
+            except Exception as e:
+                logger.exception(f"خطا در نمایش تاریخچه: {e}")
+                await event.respond(f"❌ خطا: {str(e)}")
+
         @self.bot.on(events.CallbackQuery(pattern=b"note_yes"))
         async def note_yes_callback(event):
             """کاربر می‌خواهد یادداشت بزند"""
@@ -4635,7 +6238,7 @@ class BotHandler:
                     f"را ثبت کنید.",
                     buttons=Button.inline("❌ لغو", b"note_skip")
                 )
-        
+            
         @self.bot.on(events.CallbackQuery(pattern=b"note_no"))
         async def note_no_callback(event):
             """کاربر نمی‌خواهد یادداشت بزند (تک ربات)"""

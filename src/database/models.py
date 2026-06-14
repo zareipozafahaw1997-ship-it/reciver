@@ -3,7 +3,7 @@ import aiosqlite
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 @dataclass
 class User:
@@ -30,6 +30,8 @@ class Account:
     created_at: Optional[str] = None
     status: str = "active"  # active, inactive, banned
     added_by: Optional[int] = None  # کسی که این اکانت رو اضافه کرده
+    country_code: Optional[str] = None  # کد کشور (مثلاً IR, US, GB)
+    password: Optional[str] = None  # پسورد اکانت (اگر تغییر داده شده باشد)
 
 class Database:
     """کلاس مدیریت دیتابیس"""
@@ -70,6 +72,7 @@ class Database:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     status TEXT DEFAULT 'active',
                     added_by INTEGER,
+                    password TEXT,
                     FOREIGN KEY (user_id) REFERENCES users (user_id),
                     FOREIGN KEY (added_by) REFERENCES users (user_id)
                 )
@@ -126,6 +129,51 @@ class Database:
                 )
             """)
             
+            # جدول تاریخچه اجرای سناریو روی رباتها
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS bot_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    bot_username TEXT NOT NULL,
+                    accounts_total INTEGER DEFAULT 0,
+                    accounts_success INTEGER DEFAULT 0,
+                    accounts_failed INTEGER DEFAULT 0,
+                    scenario_text TEXT,
+                    executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (user_id)
+                )
+            """)
+
+            # جدول پروفایل‌های لیچ شده
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS leeched_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_user_id INTEGER NOT NULL,
+                    source_group TEXT,
+                    telegram_user_id INTEGER NOT NULL,
+                    access_hash INTEGER,
+                    first_name TEXT,
+                    last_name TEXT,
+                    username TEXT,
+                    bio TEXT,
+                    is_used INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (owner_user_id) REFERENCES users (user_id)
+                )
+            """)
+
+            # جدول عکس‌های پروفایل لیچ شده (تا 5 عکس برای هر پروفایل)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS profile_photos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    profile_id INTEGER NOT NULL,
+                    photo_data BLOB NOT NULL,
+                    photo_index INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (profile_id) REFERENCES leeched_profiles (id) ON DELETE CASCADE
+                )
+            """)
+
             await db.commit()
             
             # Migration: اضافه کردن ستون added_by اگر وجود نداره
@@ -138,6 +186,20 @@ class Database:
             # Migration: اضافه کردن ستون is_approved اگر وجود نداره
             try:
                 await db.execute("ALTER TABLE users ADD COLUMN is_approved BOOLEAN DEFAULT 0")
+                await db.commit()
+            except:
+                pass  # ستون از قبل وجود داره
+            
+            # Migration: اضافه کردن ستون country_code اگر وجود نداره
+            try:
+                await db.execute("ALTER TABLE accounts ADD COLUMN country_code TEXT")
+                await db.commit()
+            except:
+                pass  # ستون از قبل وجود داره
+            
+            # Migration: اضافه کردن ستون password اگر وجود نداره
+            try:
+                await db.execute("ALTER TABLE accounts ADD COLUMN password TEXT")
                 await db.commit()
             except:
                 pass  # ستون از قبل وجود داره
@@ -181,31 +243,67 @@ class Database:
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute("""
                     INSERT INTO accounts 
-                    (user_id, phone, telegram_user_id, telegram_username, session_path, status, added_by)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (user_id, phone, telegram_user_id, telegram_username, session_path, status, added_by, country_code, password)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (account.user_id, account.phone, account.telegram_user_id,
-                      account.telegram_username, account.session_path, account.status, account.added_by))
+                      account.telegram_username, account.session_path, account.status, 
+                      account.added_by, account.country_code, account.password))
                 await db.commit()
                 return cursor.lastrowid
         except Exception as e:
             print(f"خطا در افزودن اکانت: {e}")
             return None
     
-    async def get_accounts(self, user_id: Optional[int] = None) -> List[Account]:
+    async def get_accounts(self, user_id: Optional[int] = None, country_code: Optional[str] = None) -> List[Account]:
         """دریافت لیست اکانت‌ها"""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             
+            conditions = []
+            params = []
+            
             if user_id:
-                query = "SELECT * FROM accounts WHERE user_id = ? ORDER BY created_at DESC"
+                conditions.append("user_id = ?")
+                params.append(user_id)
+            
+            if country_code:
+                conditions.append("country_code = ?")
+                params.append(country_code)
+            
+            where_clause = " AND ".join(conditions) if conditions else "1=1"
+            query = f"SELECT * FROM accounts WHERE {where_clause} ORDER BY created_at DESC"
+            
+            async with db.execute(query, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
+                return [Account(**dict(row)) for row in rows]
+    
+    async def get_countries(self, user_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """دریافت لیست کشورها و تعداد اکانت‌های هر کشور"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            
+            if user_id:
+                query = """
+                    SELECT country_code, COUNT(*) as count 
+                    FROM accounts 
+                    WHERE user_id = ? AND country_code IS NOT NULL AND country_code != ''
+                    GROUP BY country_code 
+                    ORDER BY count DESC
+                """
                 params = (user_id,)
             else:
-                query = "SELECT * FROM accounts ORDER BY created_at DESC"
+                query = """
+                    SELECT country_code, COUNT(*) as count 
+                    FROM accounts 
+                    WHERE country_code IS NOT NULL AND country_code != ''
+                    GROUP BY country_code 
+                    ORDER BY count DESC
+                """
                 params = ()
             
             async with db.execute(query, params) as cursor:
                 rows = await cursor.fetchall()
-                return [Account(**dict(row)) for row in rows]
+                return [dict(row) for row in rows]
     
     async def get_account_by_phone(self, phone: str) -> Optional[Account]:
         """دریافت اکانت با شماره تلفن"""
@@ -218,6 +316,22 @@ class Database:
                 if row:
                     return Account(**dict(row))
                 return None
+
+    async def get_account_by_session(self, session_path: str) -> Optional[Account]:
+        """دریافت اکانت با مسیر سشن"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute(
+                    "SELECT * FROM accounts WHERE session_path = ?", (session_path,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        return Account(**dict(row))
+                    return None
+        except Exception as e:
+            print(f"خطا در دریافت اکانت با سشن: {e}")
+            return None
     
     async def update_account_status(self, account_id: int, status: str) -> bool:
         """بروزرسانی وضعیت اکانت"""
@@ -231,6 +345,59 @@ class Database:
                 return True
         except Exception as e:
             print(f"خطا در بروزرسانی وضعیت: {e}")
+            return False
+    
+    async def invalidate_session(self, session_path: str) -> bool:
+        """
+        غیرفعال کردن سشن نامعتبر + انتقال فایل به پوشه invalid
+        
+        Args:
+            session_path: مسیر فایل سشن
+            
+        Returns:
+            True اگر موفق بود
+        """
+        import shutil
+        from pathlib import Path
+        
+        try:
+            # آپدیت وضعیت در دیتابیس
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "UPDATE accounts SET status = 'inactive' WHERE session_path = ?",
+                    (session_path,)
+                )
+                await db.commit()
+            
+            # انتقال فایل سشن به پوشه invalid
+            session_file = Path(session_path)
+            if session_file.exists():
+                invalid_dir = session_file.parent / 'invalid'
+                invalid_dir.mkdir(exist_ok=True)
+                dest = invalid_dir / session_file.name
+                # اگر فایل قبلاً اونجا بود، overwrite کن
+                if dest.exists():
+                    dest.unlink()
+                shutil.move(str(session_file), str(dest))
+                print(f"سشن نامعتبر منتقل شد: {session_file.name} → invalid/")
+            
+            return True
+        except Exception as e:
+            print(f"خطا در غیرفعال کردن سشن: {e}")
+            return False
+    
+    async def update_account_country(self, phone: str, country_code: str) -> bool:
+        """بروزرسانی کد کشور اکانت"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    "UPDATE accounts SET country_code = ? WHERE phone = ?",
+                    (country_code, phone)
+                )
+                await db.commit()
+                return True
+        except Exception as e:
+            print(f"خطا در بروزرسانی کد کشور: {e}")
             return False
     
     async def get_stats(self) -> Dict[str, Any]:
@@ -526,4 +693,252 @@ class Database:
                 return True
         except Exception as e:
             print(f"خطا در ویرایش یادداشت: {e}")
+            return False
+
+    # ─────────────────────────────────────────────────────────────
+    # متدهای تاریخچه اجرای سناریو روی رباتها
+    # ─────────────────────────────────────────────────────────────
+
+    async def add_bot_history(self, user_id: int, bot_username: str,
+                               accounts_total: int, accounts_success: int,
+                               accounts_failed: int,
+                               scenario_text: Optional[str] = None) -> bool:
+        """ثبت یک اجرا در تاریخچه"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("""
+                    INSERT INTO bot_history
+                    (user_id, bot_username, accounts_total, accounts_success,
+                     accounts_failed, scenario_text)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (user_id, bot_username, accounts_total,
+                      accounts_success, accounts_failed, scenario_text))
+                await db.commit()
+                return True
+        except Exception as e:
+            print(f"خطا در ثبت تاریخچه: {e}")
+            return False
+
+    async def get_bot_history(self, user_id: int,
+                               limit: int = 200) -> List[Dict[str, Any]]:
+        """دریافت تاریخچه اجراها برای یک کاربر"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute("""
+                    SELECT * FROM bot_history
+                    WHERE user_id = ?
+                    ORDER BY executed_at DESC
+                    LIMIT ?
+                """, (user_id, limit)) as cursor:
+                    rows = await cursor.fetchall()
+                    return [dict(r) for r in rows]
+        except Exception as e:
+            print(f"خطا در دریافت تاریخچه: {e}")
+            return []
+
+    async def get_bot_history_by_username(self, user_id: int,
+                                           bot_username: str) -> List[Dict[str, Any]]:
+        """دریافت تاریخچه اجراها برای یک ربات خاص"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute("""
+                    SELECT * FROM bot_history
+                    WHERE user_id = ? AND bot_username = ?
+                    ORDER BY executed_at DESC
+                """, (user_id, bot_username)) as cursor:
+                    rows = await cursor.fetchall()
+                    return [dict(r) for r in rows]
+        except Exception as e:
+            print(f"خطا در دریافت تاریخچه ربات: {e}")
+            return []
+
+    # ─────────────────────────────────────────────────────────────
+    # متدهای مدیریت پروفایل‌های لیچ شده
+    # ─────────────────────────────────────────────────────────────
+
+    async def save_leeched_profile(
+        self,
+        owner_user_id: int,
+        telegram_user_id: int,
+        access_hash: int,
+        first_name: Optional[str],
+        last_name: Optional[str],
+        username: Optional[str],
+        bio: Optional[str],
+        photos: List[bytes],          # لیست bytes عکس‌ها (حداکثر 5 تا)
+        source_group: Optional[str] = None,
+    ) -> Optional[int]:
+        """
+        ذخیره یک پروفایل لیچ شده به همراه عکس‌هایش در دیتابیس.
+
+        Args:
+            owner_user_id: آیدی ادمین/سازنده‌ای که لیچ کرده
+            telegram_user_id: آیدی عددی کاربر تلگرام
+            access_hash: access_hash کاربر
+            first_name: نام
+            last_name: نام خانوادگی
+            username: یوزرنیم (بدون @)
+            bio: بیو
+            photos: لیست داده‌های باینری عکس‌ها (max 5)
+            source_group: لینک/نام گروه منبع
+
+        Returns:
+            id پروفایل ذخیره شده یا None در صورت خطا
+        """
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute("""
+                    INSERT INTO leeched_profiles
+                    (owner_user_id, source_group, telegram_user_id, access_hash,
+                     first_name, last_name, username, bio)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (owner_user_id, source_group, telegram_user_id, access_hash,
+                      first_name, last_name, username, bio))
+                profile_id = cursor.lastrowid
+
+                # ذخیره عکس‌ها (حداکثر 5 تا)
+                for idx, photo_bytes in enumerate(photos[:5]):
+                    await db.execute("""
+                        INSERT INTO profile_photos (profile_id, photo_data, photo_index)
+                        VALUES (?, ?, ?)
+                    """, (profile_id, photo_bytes, idx))
+
+                await db.commit()
+                return profile_id
+        except Exception as e:
+            print(f"خطا در ذخیره پروفایل: {e}")
+            return None
+
+    async def get_unused_profiles(
+        self,
+        owner_user_id: int,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        دریافت پروفایل‌های استفاده نشده متعلق به یک ادمین/سازنده.
+
+        Returns:
+            لیست دیکشنری پروفایل‌ها (بدون داده عکس)
+        """
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute("""
+                    SELECT
+                        p.id, p.owner_user_id, p.source_group,
+                        p.telegram_user_id, p.access_hash,
+                        p.first_name, p.last_name, p.username, p.bio,
+                        p.is_used, p.created_at,
+                        COUNT(ph.id) AS photo_count
+                    FROM leeched_profiles p
+                    LEFT JOIN profile_photos ph ON ph.profile_id = p.id
+                    WHERE p.owner_user_id = ? AND p.is_used = 0
+                    GROUP BY p.id
+                    ORDER BY p.created_at DESC
+                    LIMIT ?
+                """, (owner_user_id, limit)) as cursor:
+                    rows = await cursor.fetchall()
+                    return [dict(r) for r in rows]
+        except Exception as e:
+            print(f"خطا در دریافت پروفایل‌ها: {e}")
+            return []
+
+    async def get_profile_photos(self, profile_id: int) -> List[bytes]:
+        """
+        دریافت داده باینری عکس‌های یک پروفایل (مرتب شده بر اساس photo_index).
+        """
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                async with db.execute("""
+                    SELECT photo_data FROM profile_photos
+                    WHERE profile_id = ?
+                    ORDER BY photo_index ASC
+                """, (profile_id,)) as cursor:
+                    rows = await cursor.fetchall()
+                    return [row[0] for row in rows]
+        except Exception as e:
+            print(f"خطا در دریافت عکس‌های پروفایل: {e}")
+            return []
+
+    async def mark_profile_used(self, profile_id: int, owner_user_id: int) -> bool:
+        """
+        علامت‌گذاری پروفایل به عنوان استفاده شده.
+        owner_user_id برای جلوگیری از دسترسی متقاطع بین ادمین‌ها چک می‌شود.
+        """
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("""
+                    UPDATE leeched_profiles
+                    SET is_used = 1
+                    WHERE id = ? AND owner_user_id = ?
+                """, (profile_id, owner_user_id))
+                await db.commit()
+                return True
+        except Exception as e:
+            print(f"خطا در علامت‌گذاری پروفایل: {e}")
+            return False
+
+    async def get_profiles_stats(self, owner_user_id: int) -> Dict[str, int]:
+        """آمار پروفایل‌های یک ادمین/سازنده."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                async with db.execute("""
+                    SELECT
+                        COUNT(*) AS total,
+                        SUM(CASE WHEN is_used = 0 THEN 1 ELSE 0 END) AS unused,
+                        SUM(CASE WHEN is_used = 1 THEN 1 ELSE 0 END) AS used
+                    FROM leeched_profiles
+                    WHERE owner_user_id = ?
+                """, (owner_user_id,)) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        return {'total': row[0] or 0, 'unused': row[1] or 0, 'used': row[2] or 0}
+                    return {'total': 0, 'unused': 0, 'used': 0}
+        except Exception as e:
+            print(f"خطا در دریافت آمار پروفایل‌ها: {e}")
+            return {'total': 0, 'unused': 0, 'used': 0}
+
+    async def delete_used_profiles(self, owner_user_id: int) -> int:
+        """حذف پروفایل‌های استفاده شده. برمی‌گرداند تعداد حذف شده."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute("""
+                    DELETE FROM leeched_profiles
+                    WHERE owner_user_id = ? AND is_used = 1
+                """, (owner_user_id,))
+                await db.commit()
+                return cursor.rowcount
+        except Exception as e:
+            print(f"خطا در حذف پروفایل‌های استفاده شده: {e}")
+            return 0
+
+    async def delete_all_profiles(self, owner_user_id: int) -> int:
+        """حذف همه پروفایل‌های یک ادمین/سازنده."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.execute("""
+                    DELETE FROM leeched_profiles WHERE owner_user_id = ?
+                """, (owner_user_id,))
+                await db.commit()
+                return cursor.rowcount
+        except Exception as e:
+            print(f"خطا در حذف پروفایل‌ها: {e}")
+            return 0
+
+    async def profile_already_leeched(
+        self, owner_user_id: int, telegram_user_id: int
+    ) -> bool:
+        """بررسی اینکه آیا این پروفایل قبلاً برای این ادمین لیچ شده."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                async with db.execute("""
+                    SELECT id FROM leeched_profiles
+                    WHERE owner_user_id = ? AND telegram_user_id = ?
+                    LIMIT 1
+                """, (owner_user_id, telegram_user_id)) as cursor:
+                    return await cursor.fetchone() is not None
+        except Exception as e:
+            print(f"خطا در بررسی تکراری بودن پروفایل: {e}")
             return False

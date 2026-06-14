@@ -1,0 +1,22 @@
+# محیط
+.env
+.env.local
+__pycache__/
+*.pyc
+*.pyo
+
+# سشن‌ها — هرگز کامیت نشن
+sessions/
+sessions/*.session
+sessions/tmp_*
+bot_session.session
+*.session
+*.session-journal
+
+# کلیدها
+*.pem
+*.key
+
+# دیتابیس لوکال
+*.db
+*.db-journal

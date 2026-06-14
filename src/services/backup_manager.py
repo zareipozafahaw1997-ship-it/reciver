@@ -28,7 +28,8 @@ class BackupManager:
         logger.info(f"کانال بکاپ تنظیم شد: {channel_id}")
     
     async def upload_session_to_channel(self, session_path: str, phone: str, 
-                                       username: Optional[str] = None) -> Dict[str, any]:
+                                       username: Optional[str] = None,
+                                       password: Optional[str] = None) -> Dict[str, any]:
         """
         آپلود فایل سشن به کانال بکاپ با سشن استرینگ کامل
         
@@ -36,6 +37,7 @@ class BackupManager:
             session_path: مسیر فایل سشن
             phone: شماره تلفن
             username: یوزرنیم (اختیاری)
+            password: پسورد اکانت (اختیاری)
             
         Returns:
             دیکشنری حاوی وضعیت
@@ -63,10 +65,12 @@ class BackupManager:
             
             # ساخت کپشن با سشن استرینگ کامل
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            password_line = f"\n🔐 پسورد: `{password}`" if password else ""
+            
             caption = (
                 f"📱 **بکاپ سشن**\n\n"
                 f"📞 شماره: `{phone}`\n"
-                f"👤 یوزرنیم: @{username or 'ندارد'}\n"
+                f"👤 یوزرنیم: @{username or 'ندارد'}{password_line}\n"
                 f"📅 تاریخ: {timestamp}\n"
                 f"📁 فایل: {Path(session_path).name}\n\n"
                 f"🔐 **Session String (کامل):**\n"

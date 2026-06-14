@@ -1,13 +1,22 @@
 # Environment
 .env
+.env.local
+.env.*.local
 .venv
 venv/
 ENV/
 
-# Sessions
+# Sessions — never commit
 sessions/
 *.session
 *.session-journal
+aa/sessions/
+
+# Keys & certificates
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Database and backups
 data/
