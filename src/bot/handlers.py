@@ -1057,7 +1057,7 @@ class BotHandler:
         async def admin_auto_password_callback(event):
             """تنظیمات تغییر پسورد خودکار"""
             # فقط سازنده دسترسی داره
-            if not await self._check_creator_access(event):
+            if not await self._check_admin_access(event):
                 return
             
             await event.answer()
@@ -1109,7 +1109,7 @@ class BotHandler:
         async def toggle_auto_password_callback(event):
             """تغییر وضعیت تغییر پسورد خودکار"""
             # فقط سازنده دسترسی داره
-            if not await self._check_creator_access(event):
+            if not await self._check_admin_access(event):
                 return
             
             await event.answer()
@@ -1129,7 +1129,7 @@ class BotHandler:
         async def password_mode_callback(event):
             """تغییر حالت پسورد (رندوم یا دیفالت)"""
             # فقط سازنده دسترسی داره
-            if not await self._check_creator_access(event):
+            if not await self._check_admin_access(event):
                 return
             
             await event.answer()
@@ -1146,7 +1146,7 @@ class BotHandler:
         async def set_default_password_callback(event):
             """شروع فرآیند تنظیم پسورد دیفالت"""
             # فقط سازنده دسترسی داره
-            if not await self._check_creator_access(event):
+            if not await self._check_admin_access(event):
                 return
             
             await event.answer()
@@ -1168,7 +1168,7 @@ class BotHandler:
         @self.bot.on(events.CallbackQuery(pattern=b"admin_get_code"))
         async def admin_get_code_callback(event):
             """شروع فرآیند دریافت کد از سشن"""
-            if not await self._check_creator_access(event):
+            if not await self._check_admin_access(event):
                 return
             await event.answer()
             user_id = event.sender_id
@@ -1186,7 +1186,7 @@ class BotHandler:
         @self.bot.on(events.CallbackQuery(pattern=b"get_code_wait_mode"))
         async def get_code_wait_mode_callback(event):
             """تغییر حالت به انتظار کد جدید - دیگه استفاده نمی‌شه ولی برای backward compat نگه داریم"""
-            if not await self._check_creator_access(event):
+            if not await self._check_admin_access(event):
                 return
             await event.answer()
             user_id = event.sender_id
